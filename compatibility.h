@@ -16,6 +16,11 @@
 #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(3,7,0) */
 #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,31) */
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,12,0)
+	#define SPEED_2500				2500
+	#define SPEED_25000				25000
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,9,0)
+	#define BMCR_SPEED10				0x0000
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,5,0)
 	#define NETIF_F_CSUM_MASK			NETIF_F_ALL_CSUM
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,1,0)
@@ -60,10 +65,16 @@
 		return csum_ipv6_magic(saddr, daddr, len, IPPROTO_TCP, base);
 	}
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,7,0)
-	#define SPEED_UNKNOWN		0
-	#define DUPLEX_UNKNOWN		0xff
+	#ifndef SPEED_UNKNOWN
+		#define SPEED_UNKNOWN		0
+	#endif
+
+	#ifndef DUPLEX_UNKNOWN
+		#define DUPLEX_UNKNOWN		0xff
+	#endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,6,0)
 	#define eth_random_addr(addr)			random_ether_addr(addr)
+	#define usb_enable_lpm(udev)
 	#define MDIO_EEE_100TX				MDIO_AN_EEE_ADV_100TX	/* 100TX EEE cap */
 	#define MDIO_EEE_1000T				MDIO_AN_EEE_ADV_1000T	/* 1000T EEE cap */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,4,0)
@@ -450,6 +461,8 @@
 #endif /* LINUX_VERSION_CODE < KERNEL_VERSION(4,0,0) */
 #endif /* LINUX_VERSION_CODE < KERNEL_VERSION(4,1,0) */
 #endif /* LINUX_VERSION_CODE < KERNEL_VERSION(4,5,0) */
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(4,9,0) */
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(4,12,0) */
 
 #ifndef FALSE
 	#define TRUE	1

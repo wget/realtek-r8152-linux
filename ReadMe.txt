@@ -14,3 +14,10 @@
   driver.
 
 	# sudo update-initramfs -u
+
+- Example of setting speed
+
+	# ethtool -s eth0 autoneg on advertise 0x802f (2.5G)
+	# ethtool -s eth0 autoneg on advertise 0x002f (1G)
+	# ethtool -s eth0 autoneg on advertise 0x000f (100M full)
+	# ethtool -s eth0 autoneg on advertise 0x0003 (10M full)

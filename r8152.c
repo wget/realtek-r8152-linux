@@ -30,7 +30,7 @@
 #include "compatibility.h"
 
 /* Version Information */
-#define DRIVER_VERSION "v2.10.00 (2018/03/16)"
+#define DRIVER_VERSION "v2.11.0 (2018/12/21)"
 #define DRIVER_AUTHOR "Realtek nic sw <nic_swsd@realtek.com>"
 #define DRIVER_DESC "Realtek RTL8152/RTL8153 Based USB Ethernet Adapters"
 #define MODULENAME "r8152"
@@ -440,13 +440,14 @@
 #define UPS_FLAGS_EN_EEE		BIT(20)
 #define UPS_FLAGS_EN_500M_EEE		BIT(21)
 #define UPS_FLAGS_EN_EEE_CKDIV		BIT(22)
+#define UPS_FLAGS_EEE_PLLOFF_100	BIT(23)
 #define UPS_FLAGS_EEE_PLLOFF_GIGA	BIT(24)
 #define UPS_FLAGS_EEE_CMOD_LV_EN	BIT(25)
 #define UPS_FLAGS_EN_GREEN		BIT(26)
 #define UPS_FLAGS_EN_FLOW_CTR		BIT(27)
 
 enum spd_duplex {
-	NWAY_10M_HALF = 1,
+	NWAY_10M_HALF,
 	NWAY_10M_FULL,
 	NWAY_100M_HALF,
 	NWAY_100M_FULL,
@@ -455,6 +456,8 @@ enum spd_duplex {
 	FORCE_10M_FULL,
 	FORCE_100M_HALF,
 	FORCE_100M_FULL,
+	FORCE_1000M_FULL,
+	NWAY_2500M_FULL,
 };
 
 /* OCP_ALDPS_CONFIG */
@@ -554,6 +557,9 @@ enum spd_duplex {
 #define RX_DRIVING_MASK		0x6000
 
 enum rtl_register_content {
+	_2500bps	= BIT(10),
+	_1250bps	= BIT(9),
+	_500bps		= BIT(8),
 	_1000bps	= 0x10,
 	_100bps		= 0x08,
 	_10bps		= 0x04,
@@ -602,6 +608,7 @@ enum rtl8152_flags {
 	SCHEDULE_NAPI,
 	GREEN_ETHERNET,
 	RECOVER_SPEED,
+	SUPPORT_2500FULL,
 };
 
 /* Define these values to match your device */
@@ -737,14 +744,33 @@ struct r8152 {
 		void (*autosuspend_en)(struct r8152 *tp, bool enable);
 	} rtl_ops;
 
+	struct ups_info {
+		u32 _10m_ckdiv:1;
+		u32 _250m_ckdiv:1;
+		u32 aldps:1;
+		u32 lite_mode:2;
+		u32 speed_duplex:4;
+		u32 eee:1;
+		u32 eee_lite:1;
+		u32 eee_ckdiv:1;
+		u32 eee_plloff_100:1;
+		u32 eee_plloff_giga:1;
+		u32 eee_cmod_lv:1;
+		u32 green:1;
+		u32 flow_control:1;
+	} ups_info;
+
+	bool eee_en;
 	int intr_interval;
 	u32 saved_wolopts;
 	u32 msg_enable;
 	u32 tx_qlen;
 	u32 coalesce;
 	u32 advertising;
+	u32 rx_buf_sz;
 	u16 ocp_base;
 	u16 speed;
+	u16 eee_adv;
 	u8 *intr_buff;
 	u8 version;
 	u8 rtk_enable_diag;
@@ -763,6 +789,11 @@ enum rtl_version {
 	RTL_VER_07,
 	RTL_VER_08,
 	RTL_VER_09,
+
+	RTL_TEST_01,
+	RTL_VER_10,
+	RTL_VER_11,
+
 	RTL_VER_MAX
 };
 
@@ -1462,13 +1493,13 @@ static int alloc_all_mem(struct r8152 *tp)
 	skb_queue_head_init(&tp->rx_queue);
 
 	for (i = 0; i < RTL8152_MAX_RX; i++) {
-		buf = kmalloc_node(agg_buf_sz, GFP_KERNEL, node);
+		buf = kmalloc_node(tp->rx_buf_sz, GFP_KERNEL, node);
 		if (!buf)
 			goto err1;
 
 		if (buf != rx_agg_align(buf)) {
 			kfree(buf);
-			buf = kmalloc_node(agg_buf_sz + RX_ALIGN, GFP_KERNEL,
+			buf = kmalloc_node(tp->rx_buf_sz + RX_ALIGN, GFP_KERNEL,
 					   node);
 			if (!buf)
 				goto err1;
@@ -2178,7 +2209,7 @@ int r8152_submit_rx(struct r8152 *tp, struct rx_agg *agg, gfp_t mem_flags)
 		return 0;
 
 	usb_fill_bulk_urb(agg->urb, tp->udev, usb_rcvbulkpipe(tp->udev, 1),
-			  agg->head, agg_buf_sz,
+			  agg->head, tp->rx_buf_sz,
 			  (usb_complete_t)read_bulk_callback, agg);
 
 	ret = usb_submit_urb(agg->urb, mem_flags);
@@ -2415,15 +2446,15 @@ static void set_tx_qlen(struct r8152 *tp)
 				    sizeof(struct tx_desc));
 }
 
-static inline u8 rtl8152_get_speed(struct r8152 *tp)
+static inline u16 rtl8152_get_speed(struct r8152 *tp)
 {
-	return ocp_read_byte(tp, MCU_TYPE_PLA, PLA_PHYSTATUS);
+	return ocp_read_word(tp, MCU_TYPE_PLA, PLA_PHYSTATUS);
 }
 
 static void rtl_set_eee_plus(struct r8152 *tp)
 {
 	u32 ocp_data;
-	u8 speed;
+	u16 speed;
 
 	speed = rtl8152_get_speed(tp);
 	if (speed & _10bps) {
@@ -2577,6 +2608,16 @@ static void r8153_set_rx_early_timeout(struct r8152 *tp)
 		r8153b_rx_agg_chg_indicate(tp);
 		break;
 
+	case RTL_TEST_01:
+	case RTL_VER_10:
+	case RTL_VER_11:
+		ocp_write_word(tp, MCU_TYPE_USB, USB_RX_EARLY_TIMEOUT,
+			       640 / 8);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_RX_EXTRA_AGGR_TMR,
+			       ocp_data);
+		r8153b_rx_agg_chg_indicate(tp);
+		break;
+
 	default:
 		break;
 	}
@@ -2584,7 +2625,7 @@ static void r8153_set_rx_early_timeout(struct r8152 *tp)
 
 static void r8153_set_rx_early_size(struct r8152 *tp)
 {
-	u32 ocp_data = agg_buf_sz - rx_reserved_size(tp->netdev->mtu);
+	u32 ocp_data = tp->rx_buf_sz - rx_reserved_size(tp->netdev->mtu);
 
 	switch (tp->version) {
 	case RTL_VER_03:
@@ -2596,6 +2637,9 @@ static void r8153_set_rx_early_size(struct r8152 *tp)
 		break;
 	case RTL_VER_08:
 	case RTL_VER_09:
+	case RTL_TEST_01:
+	case RTL_VER_10:
+	case RTL_VER_11:
 		ocp_write_word(tp, MCU_TYPE_USB, USB_RX_EARLY_SIZE,
 			       ocp_data / 8);
 		r8153b_rx_agg_chg_indicate(tp);
@@ -2655,7 +2699,51 @@ static void rtl_disable(struct r8152 *tp)
 
 	rtl_stop_rx(tp);
 
-	rtl8152_nic_reset(tp);
+	switch (tp->version) {
+	case RTL_VER_01:
+	case RTL_VER_02:
+	case RTL_VER_03:
+	case RTL_VER_04:
+	case RTL_VER_05:
+	case RTL_VER_06:
+	case RTL_VER_07:
+	case RTL_VER_08:
+	case RTL_VER_09:
+		rtl8152_nic_reset(tp);
+		break;
+
+	case RTL_TEST_01:
+	case RTL_VER_10:
+	case RTL_VER_11:
+		ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, PLA_CR);
+		ocp_data &= ~CR_TE;
+		ocp_write_byte(tp, MCU_TYPE_PLA, PLA_CR, ocp_data);
+
+		ocp_data = ocp_read_word(tp, MCU_TYPE_USB, 0xd4b0);
+		ocp_data &= ~BIT(0);
+		ocp_write_word(tp, MCU_TYPE_USB, 0xd4b0, ocp_data);
+
+		ocp_data = ocp_read_word(tp, MCU_TYPE_USB, 0xd406);
+		ocp_data |= BIT(3);
+		ocp_write_word(tp, MCU_TYPE_USB, 0xd406, ocp_data);
+
+		ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, PLA_CR);
+		ocp_data &= ~CR_RE;
+		ocp_write_byte(tp, MCU_TYPE_PLA, PLA_CR, ocp_data);
+
+		ocp_data = ocp_read_word(tp, MCU_TYPE_USB, 0xd4b0);
+		ocp_data |= BIT(0);
+		ocp_write_word(tp, MCU_TYPE_USB, 0xd4b0, ocp_data);
+
+		ocp_data = ocp_read_word(tp, MCU_TYPE_USB, 0xd406);
+		ocp_data &= ~BIT(3);
+		ocp_write_word(tp, MCU_TYPE_USB, 0xd406, ocp_data);
+		break;
+
+	default:
+		ocp_write_byte(tp, MCU_TYPE_PLA, PLA_CR, 0);
+		break;
+	}
 }
 
 static void r8152_power_cut_en(struct r8152 *tp, bool enable)
@@ -2678,12 +2766,36 @@ static void rtl_rx_vlan_en(struct r8152 *tp, bool enable)
 {
 	u32 ocp_data;
 
-	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_CPCR);
-	if (enable)
-		ocp_data |= CPCR_RX_VLAN;
-	else
-		ocp_data &= ~CPCR_RX_VLAN;
-	ocp_write_word(tp, MCU_TYPE_PLA, PLA_CPCR, ocp_data);
+	switch (tp->version) {
+	case RTL_VER_01:
+	case RTL_VER_02:
+	case RTL_VER_03:
+	case RTL_VER_04:
+	case RTL_VER_05:
+	case RTL_VER_06:
+	case RTL_VER_07:
+	case RTL_VER_08:
+	case RTL_VER_09:
+		ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_CPCR);
+		if (enable)
+			ocp_data |= CPCR_RX_VLAN;
+		else
+			ocp_data &= ~CPCR_RX_VLAN;
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_CPCR, ocp_data);
+		break;
+
+	case RTL_TEST_01:
+	case RTL_VER_10:
+	case RTL_VER_11:
+	default:
+		ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, 0xc012);
+		if (enable)
+			ocp_data |= BIT(7) | BIT(6);
+		else
+			ocp_data &= ~(BIT(7) | BIT(6));
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_CPCR, ocp_data);
+		break;
+	}
 }
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,0,0)
@@ -2841,6 +2953,26 @@ static void r8153_mac_clk_spd(struct r8152 *tp, bool enable)
 	}
 }
 
+static void r8156_mac_clk_spd(struct r8152 *tp, bool enable)
+{
+	u32 ocp_data;
+
+	/* MAC clock speed down */
+	if (enable) {
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL,
+			       0x0403);
+
+		ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL2);
+		ocp_data &= ~0xff;
+		ocp_data |= MAC_CLK_SPDWN_EN | 0x03;
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL2, ocp_data);
+	} else {
+		ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL2);
+		ocp_data &= ~MAC_CLK_SPDWN_EN;
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL2, ocp_data);
+	}
+}
+
 static void r8153_u1u2en(struct r8152 *tp, bool enable)
 {
 	u8 u1u2[8];
@@ -2878,14 +3010,155 @@ static void r8153_u2p3en(struct r8152 *tp, bool enable)
 	ocp_write_word(tp, MCU_TYPE_USB, USB_U2P3_CTRL, ocp_data);
 }
 
-static void r8153b_ups_flags_w1w0(struct r8152 *tp, u32 set, u32 clear)
+static void r8153b_ups_flags(struct r8152 *tp)
 {
-	u32 ocp_data;
+	u32 ups_flags = 0;
 
-	ocp_data = ocp_read_dword(tp, MCU_TYPE_USB, USB_UPS_FLAGS);
-	ocp_data &= ~clear;
-	ocp_data |= set;
-	ocp_write_dword(tp, MCU_TYPE_USB, USB_UPS_FLAGS, ocp_data);
+	if (tp->ups_info.green)
+		ups_flags |= UPS_FLAGS_EN_GREEN;
+
+	if (tp->ups_info.aldps)
+		ups_flags |= UPS_FLAGS_EN_ALDPS;
+
+	if (tp->ups_info.eee)
+		ups_flags |= UPS_FLAGS_EN_EEE;
+
+	if (tp->ups_info.flow_control)
+		ups_flags |= UPS_FLAGS_EN_FLOW_CTR;
+
+	if (tp->ups_info.eee_ckdiv)
+		ups_flags |= UPS_FLAGS_EN_EEE_CKDIV;
+
+	if (tp->ups_info.eee_cmod_lv)
+		ups_flags |= UPS_FLAGS_EEE_CMOD_LV_EN;
+
+	if (tp->ups_info._10m_ckdiv)
+		ups_flags |= UPS_FLAGS_EN_10M_CKDIV;
+
+	if (tp->ups_info.eee_plloff_100)
+		ups_flags |= UPS_FLAGS_EEE_PLLOFF_100;
+
+	if (tp->ups_info.eee_plloff_giga)
+		ups_flags |= UPS_FLAGS_EEE_PLLOFF_GIGA;
+
+	if (tp->ups_info._250m_ckdiv)
+		ups_flags |= UPS_FLAGS_250M_CKDIV;
+
+	switch (tp->ups_info.speed_duplex) {
+	case NWAY_10M_HALF:
+		ups_flags |= 1 << 16;
+		break;
+	case NWAY_10M_FULL:
+		ups_flags |= 2 << 16;
+		break;
+	case NWAY_100M_HALF:
+		ups_flags |= 3 << 16;
+		break;
+	case NWAY_100M_FULL:
+		ups_flags |= 4 << 16;
+		break;
+	case NWAY_1000M_FULL:
+		ups_flags |= 5 << 16;
+		break;
+	case FORCE_10M_HALF:
+		ups_flags |= 6 << 16;
+		break;
+	case FORCE_10M_FULL:
+		ups_flags |= 7 << 16;
+		break;
+	case FORCE_100M_HALF:
+		ups_flags |= 8 << 16;
+		break;
+	case FORCE_100M_FULL:
+		ups_flags |= 9 << 16;
+		break;
+	default:
+		break;
+	}
+
+	ocp_write_dword(tp, MCU_TYPE_USB, USB_UPS_FLAGS, ups_flags);
+}
+
+static void r8156_ups_flags(struct r8152 *tp)
+{
+	u32 ups_flags = 0;
+
+	if (tp->ups_info.green)
+		ups_flags |= UPS_FLAGS_EN_GREEN;
+
+	if (tp->ups_info.aldps)
+		ups_flags |= UPS_FLAGS_EN_ALDPS;
+
+	if (tp->ups_info.eee)
+		ups_flags |= UPS_FLAGS_EN_EEE;
+
+	if (tp->ups_info.flow_control)
+		ups_flags |= UPS_FLAGS_EN_FLOW_CTR;
+
+	if (tp->ups_info.eee_ckdiv)
+		ups_flags |= UPS_FLAGS_EN_EEE_CKDIV;
+
+	if (tp->ups_info._10m_ckdiv)
+		ups_flags |= UPS_FLAGS_EN_10M_CKDIV;
+
+	if (tp->ups_info.eee_plloff_100)
+		ups_flags |= UPS_FLAGS_EEE_PLLOFF_100;
+
+	if (tp->ups_info.eee_plloff_giga)
+		ups_flags |= UPS_FLAGS_EEE_PLLOFF_GIGA;
+
+	if (tp->ups_info._250m_ckdiv)
+		ups_flags |= UPS_FLAGS_250M_CKDIV;
+
+	switch (tp->ups_info.speed_duplex) {
+	case FORCE_10M_HALF:
+		ups_flags |= 0 << 16;
+		break;
+	case FORCE_10M_FULL:
+		ups_flags |= 1 << 16;
+		break;
+	case FORCE_100M_HALF:
+		ups_flags |= 2 << 16;
+		break;
+	case FORCE_100M_FULL:
+		ups_flags |= 3 << 16;
+		break;
+	case NWAY_10M_HALF:
+		ups_flags |= 4 << 16;
+		break;
+	case NWAY_10M_FULL:
+		ups_flags |= 5 << 16;
+		break;
+	case NWAY_100M_HALF:
+		ups_flags |= 6 << 16;
+		break;
+	case NWAY_100M_FULL:
+		ups_flags |= 7 << 16;
+		break;
+	case NWAY_1000M_FULL:
+		ups_flags |= 8 << 16;
+		break;
+	case NWAY_2500M_FULL:
+		ups_flags |= 9 << 16;
+		break;
+	default:
+		break;
+	}
+
+	switch (tp->ups_info.lite_mode) {
+	case 0:
+		ups_flags |= 1 << 5;
+		break;
+	case 1:
+		ups_flags |= 0 << 5;
+		break;
+	case 2:
+	default:
+		ups_flags |= 2 << 5;
+		break;
+	}
+
+	ocp_write_dword(tp, MCU_TYPE_USB, USB_UPS_FLAGS, ups_flags);
 }
 
 static void r8153b_green_en(struct r8152 *tp, bool enable)
@@ -2906,7 +3179,7 @@ static void r8153b_green_en(struct r8152 *tp, bool enable)
 	data |= GREEN_ETH_EN;
 	sram_write(tp, SRAM_GREEN_CFG, data);
 
-	r8153b_ups_flags_w1w0(tp, UPS_FLAGS_EN_GREEN, 0);
+	tp->ups_info.green = enable;
 }
 
 static u16 r8153_phy_status(struct r8152 *tp, u16 desired)
@@ -2936,6 +3209,8 @@ static void r8153b_ups_en(struct r8152 *tp, bool enable)
 	u32 ocp_data = ocp_read_byte(tp, MCU_TYPE_USB, USB_POWER_CUT);
 
 	if (enable) {
+		r8153b_ups_flags(tp);
+
 		ocp_data |= UPS_EN | USP_PREWAKE | PHASE2_EN;
 		ocp_write_byte(tp, MCU_TYPE_USB, USB_POWER_CUT, ocp_data);
 
@@ -2980,6 +3255,37 @@ static void r8153b_ups_en(struct r8152 *tp, bool enable)
 	}
 }
 
+static void r8156_ups_en(struct r8152 *tp, bool enable)
+{
+	u32 ocp_data = ocp_read_byte(tp, MCU_TYPE_USB, USB_POWER_CUT);
+
+	if (enable) {
+		r8156_ups_flags(tp);
+
+		ocp_data |= UPS_EN | USP_PREWAKE | PHASE2_EN;
+		ocp_write_byte(tp, MCU_TYPE_USB, USB_POWER_CUT, ocp_data);
+
+		ocp_data = ocp_read_byte(tp, MCU_TYPE_USB, 0xcfff);
+		ocp_data |= BIT(0);
+		ocp_write_byte(tp, MCU_TYPE_USB, 0xcfff, ocp_data);
+	} else {
+		ocp_data &= ~(UPS_EN | USP_PREWAKE);
+		ocp_write_byte(tp, MCU_TYPE_USB, USB_POWER_CUT, ocp_data);
+
+		ocp_data = ocp_read_byte(tp, MCU_TYPE_USB, 0xcfff);
+		ocp_data &= ~BIT(0);
+		ocp_write_byte(tp, MCU_TYPE_USB, 0xcfff, ocp_data);
+
+//		ocp_data = ocp_read_word(tp, MCU_TYPE_USB, 0xd32a);
+//		ocp_data &= ~(BIT(8) | BIT(9));
+//		ocp_write_word(tp, MCU_TYPE_USB, 0xd32a, ocp_data);
+
+		ocp_data = ocp_read_word(tp, MCU_TYPE_USB, USB_MISC_0);
+		if (ocp_data & PCUT_STATUS)
+			tp->rtl_ops.hw_phy_cfg(tp);
+	}
+}
+
 static void r8153_power_cut_en(struct r8152 *tp, bool enable)
 {
 	u32 ocp_data;
@@ -3016,16 +3322,27 @@ static void r8153b_queue_wake(struct r8152 *tp, bool enable)
 {
 	u32 ocp_data;
 
-	ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, 0xd38a);
+	ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, 0xd38c);
 	if (enable)
 		ocp_data |= BIT(0);
 	else
 		ocp_data &= ~BIT(0);
-	ocp_write_byte(tp, MCU_TYPE_PLA, 0xd38a, ocp_data);
-
-	ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, 0xd38c);
-	ocp_data &= ~BIT(0);
 	ocp_write_byte(tp, MCU_TYPE_PLA, 0xd38c, ocp_data);
+
+	ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, 0xd38a);
+	ocp_data &= ~BIT(0);
+	ocp_write_byte(tp, MCU_TYPE_PLA, 0xd38a, ocp_data);
+}
+
+static void r8156_queue_wake(struct r8152 *tp, bool enable)
+{
+	u32 ocp_data;
+
+	r8153b_queue_wake(tp, enable);
+
+	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, 0xd398);
+	ocp_data &= ~BIT(8);
+	ocp_write_word(tp, MCU_TYPE_PLA, 0xd398, ocp_data);
 }
 
 static bool rtl_can_wakeup(struct r8152 *tp)
@@ -3107,6 +3424,25 @@ static void rtl8153b_runtime_enable(struct r8152 *tp, bool enable)
 	}
 }
 
+static void rtl8156_runtime_enable(struct r8152 *tp, bool enable)
+{
+	if (enable) {
+		r8156_queue_wake(tp, true);
+		r8153b_u1u2en(tp, false);
+		r8153_u2p3en(tp, false);
+		rtl_runtime_suspend_enable(tp, true);
+//		if (tp->version != RTL_VER_10 ||
+//		    tp->udev->speed == USB_SPEED_HIGH)
+//			r8156_ups_en(tp, true);
+	} else {
+		r8156_ups_en(tp, false);
+		r8156_queue_wake(tp, false);
+		rtl_runtime_suspend_enable(tp, false);
+		r8153_u2p3en(tp, true);
+		r8153b_u1u2en(tp, true);
+	}
+}
+
 static int rtl_nway_restart(struct r8152 *tp)
 {
 	int r = -EINVAL;
@@ -3144,6 +3480,9 @@ static void r8153_teredo_off(struct r8152 *tp)
 
 	case RTL_VER_08:
 	case RTL_VER_09:
+	case RTL_TEST_01:
+	case RTL_VER_10:
+	case RTL_VER_11:
 		/* The bit 0 ~ 7 are relative with teredo settings. They are
 		 * W1C (write 1 to clear), so set all 1 to disable it.
 		 */
@@ -3192,7 +3531,6 @@ static void r8153_clear_bp(struct r8152 *tp)
 	rtl_clear_bp(tp);
 }
 
-/*
 static void r8153b_clear_bp(struct r8152 *tp, u16 type)
 {
 	if (type == MCU_TYPE_PLA)
@@ -3222,7 +3560,6 @@ static void r8153b_clear_bp(struct r8152 *tp, u16 type)
 	usleep_range(3000, 6000);
 	ocp_write_word(tp, type, PLA_BP_BA, 0);
 }
-*/
 
 static void patch4(struct r8152 *tp)
 {
@@ -3900,7 +4237,7 @@ static void r8152_eee_en(struct r8152 *tp, bool enable)
 static void r8152b_enable_eee(struct r8152 *tp)
 {
 	r8152_eee_en(tp, true);
-	r8152_mmd_write(tp, MDIO_MMD_AN, MDIO_AN_EEE_ADV, MDIO_EEE_100TX);
+	r8152_mmd_write(tp, MDIO_MMD_AN, MDIO_AN_EEE_ADV, tp->eee_adv);
 }
 
 static void r8152b_enable_fc(struct r8152 *tp)
@@ -3910,6 +4247,8 @@ static void r8152b_enable_fc(struct r8152 *tp)
 	anar = r8152_mdio_read(tp, MII_ADVERTISE);
 	anar |= ADVERTISE_PAUSE_CAP | ADVERTISE_PAUSE_ASYM;
 	r8152_mdio_write(tp, MII_ADVERTISE, anar);
+
+	tp->ups_info.flow_control = true;
 }
 
 static void rtl8152_disable(struct r8152 *tp)
@@ -4061,19 +4400,22 @@ static void r8152b_enter_oob(struct r8152 *tp)
 
 static int r8153_patch_request(struct r8152 *tp, bool request)
 {
-	u16 data;
+	u16 data, check;
 	int i;
 
 	data = ocp_reg_read(tp, OCP_PHY_PATCH_CMD);
-	if (request)
+	if (request) {
 		data |= PATCH_REQUEST;
-	else
+		check = 0;
+	} else {
 		data &= ~PATCH_REQUEST;
+		check = PATCH_READY;
+	}
 	ocp_reg_write(tp, OCP_PHY_PATCH_CMD, data);
 
-	for (i = 0; request && i < 5000; i++) {
+	for (i = 0; i < 5000; i++) {
 		usleep_range(1000, 2000);
-		if (ocp_reg_read(tp, OCP_PHY_PATCH_STAT) & PATCH_READY)
+		if ((ocp_reg_read(tp, OCP_PHY_PATCH_STAT) & PATCH_READY) ^ check)
 			break;
 	}
 
@@ -4114,6 +4456,40 @@ static int r8153_post_ram_code(struct r8152 *tp, u16 key_addr)
 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_OCP_GPHY_BASE, tp->ocp_base);
 
 	return 0;
+}
+
+static int r8156_lock_mian(struct r8152 *tp, bool lock)
+{
+	u16 data;
+	int i;
+
+	data = ocp_reg_read(tp, 0xa46a);
+	if (lock)
+		data |= BIT(1);
+	else
+		data &= ~BIT(1);
+	ocp_reg_write(tp, 0xa46a, data);
+
+	if (lock) {
+		for (i = 0; i < 100; i++) {
+			usleep_range(1000, 2000);
+			data = ocp_reg_read(tp, 0xa730) & 0xff;
+			if (data == 1)
+				break;
+		}
+	} else {
+		for (i = 0; i < 100; i++) {
+			usleep_range(1000, 2000);
+			data = ocp_reg_read(tp, 0xa730) & 0xff;
+			if (data != 1)
+				break;
+		}
+	}
+
+	if (i == 100)
+		return -ETIME;
+	else
+		return 0;
 }
 
 static void r8153_wdt1_end(struct r8152 *tp)
@@ -5234,6 +5610,1451 @@ static void r8153b_firmware(struct r8152 *tp)
 }
 */
 
+static void r8156_firmware(struct r8152 *tp)
+{
+	if (tp->version == RTL_TEST_01) {
+		static u8 usb3_patch_t[] = {
+			0x01, 0xe0, 0x05, 0xc7,
+			0xf6, 0x65, 0x02, 0xc0,
+			0x00, 0xb8, 0x40, 0x03,
+			0x00, 0xd4, 0x00, 0x00 };
+		u16 data;
+
+		ocp_reg_write(tp, 0xb87c, 0x8099);
+		ocp_reg_write(tp, 0xb87e, 0x2a50);
+		ocp_reg_write(tp, 0xb87c, 0x80a1);
+		ocp_reg_write(tp, 0xb87e, 0x2a50);
+		ocp_reg_write(tp, 0xb87c, 0x809a);
+		ocp_reg_write(tp, 0xb87e, 0x5010);
+		ocp_reg_write(tp, 0xb87c, 0x80a2);
+		ocp_reg_write(tp, 0xb87e, 0x500f);
+		ocp_reg_write(tp, 0xb87c, 0x8087);
+		ocp_reg_write(tp, 0xb87e, 0xc0cf);
+		ocp_reg_write(tp, 0xb87c, 0x8080);
+		ocp_reg_write(tp, 0xb87e, 0x0f16);
+		ocp_reg_write(tp, 0xb87c, 0x8089);
+		ocp_reg_write(tp, 0xb87e, 0x161b);
+		ocp_reg_write(tp, 0xb87c, 0x808a);
+		ocp_reg_write(tp, 0xb87e, 0x1b1f);
+
+		ocp_reg_write(tp, 0xac36, 0x0080);
+		ocp_reg_write(tp, 0xac4a, 0xff00);
+		data = ocp_reg_read(tp, 0xac34);
+		data &= ~BIT(4);
+		data |= BIT(2) | BIT(3);
+		ocp_reg_write(tp, 0xac34, data);
+
+		data = ocp_reg_read(tp, 0xac54);
+		data &= ~(BIT(9) | BIT(10));
+		ocp_reg_write(tp, 0xac54, data);
+		ocp_reg_write(tp, 0xb87c, 0x8099);
+		ocp_reg_write(tp, 0xb87e, 0x2050);
+		ocp_reg_write(tp, 0xb87c, 0x80a1);
+		ocp_reg_write(tp, 0xb87e, 0x2050);
+		ocp_reg_write(tp, 0xb87c, 0x809a);
+		ocp_reg_write(tp, 0xb87e, 0x5010);
+		ocp_reg_write(tp, 0xb87c, 0x80a2);
+		ocp_reg_write(tp, 0xb87e, 0x500f);
+		data = ocp_reg_read(tp, 0xac34);
+		data &= ~BIT(5);
+		data |= BIT(6) | BIT(7);
+		ocp_reg_write(tp, 0xac34, data);
+
+		if (r8153_patch_request(tp, true)) {
+			netif_err(tp, drv, tp->netdev,
+				  "patch request error\n");
+			return;
+		}
+
+		data = ocp_reg_read(tp, 0xb896);
+		data &= ~BIT(0);
+		ocp_reg_write(tp, 0xb896, data);
+		ocp_reg_write(tp, 0xb892, 0x0000);
+		ocp_reg_write(tp, 0xb88e, 0xc089);
+		ocp_reg_write(tp, 0xb890, 0xc1d0);
+		ocp_reg_write(tp, 0xb88e, 0xc08a);
+		ocp_reg_write(tp, 0xb890, 0xe0f0);
+		ocp_reg_write(tp, 0xb88e, 0xc08b);
+		ocp_reg_write(tp, 0xb890, 0xe0f0);
+		ocp_reg_write(tp, 0xb88e, 0xc08c);
+		ocp_reg_write(tp, 0xb890, 0xffff);
+		ocp_reg_write(tp, 0xb88e, 0xc08d);
+		ocp_reg_write(tp, 0xb890, 0xffff);
+		ocp_reg_write(tp, 0xb88e, 0xc08e);
+		ocp_reg_write(tp, 0xb890, 0xffff);
+		ocp_reg_write(tp, 0xb88e, 0xc08f);
+		ocp_reg_write(tp, 0xb890, 0xffff);
+		ocp_reg_write(tp, 0xb88e, 0xc090);
+		ocp_reg_write(tp, 0xb890, 0xff12);
+
+		ocp_reg_write(tp, 0xb88e, 0xc09a);
+		ocp_reg_write(tp, 0xb890, 0x191a);
+		ocp_reg_write(tp, 0xb88e, 0xc09b);
+		ocp_reg_write(tp, 0xb890, 0x191a);
+		ocp_reg_write(tp, 0xb88e, 0xc09e);
+		ocp_reg_write(tp, 0xb890, 0x1d1e);
+		ocp_reg_write(tp, 0xb88e, 0xc09f);
+		ocp_reg_write(tp, 0xb890, 0x1d1e);
+		ocp_reg_write(tp, 0xb88e, 0xc0a0);
+		ocp_reg_write(tp, 0xb890, 0x1f20);
+		ocp_reg_write(tp, 0xb88e, 0xc0a1);
+		ocp_reg_write(tp, 0xb890, 0x1f20);
+		ocp_reg_write(tp, 0xb88e, 0xc0a2);
+		ocp_reg_write(tp, 0xb890, 0x2122);
+		ocp_reg_write(tp, 0xb88e, 0xc0a3);
+		ocp_reg_write(tp, 0xb890, 0x2122);
+		ocp_reg_write(tp, 0xb88e, 0xc0a4);
+		ocp_reg_write(tp, 0xb890, 0x2324);
+		ocp_reg_write(tp, 0xb88e, 0xc0a5);
+		ocp_reg_write(tp, 0xb890, 0x2324);
+
+		ocp_reg_write(tp, 0xb88e, 0xc029);
+		ocp_reg_write(tp, 0xb890, 0xdff3);
+		ocp_reg_write(tp, 0xb88e, 0xc02a);
+		ocp_reg_write(tp, 0xb890, 0xf3f3);
+		ocp_reg_write(tp, 0xb88e, 0xc02b);
+		ocp_reg_write(tp, 0xb890, 0xf3f3);
+		ocp_reg_write(tp, 0xb88e, 0xc02c);
+		ocp_reg_write(tp, 0xb890, 0xf3ef);
+		ocp_reg_write(tp, 0xb88e, 0xc02d);
+		ocp_reg_write(tp, 0xb890, 0xf3ef);
+		ocp_reg_write(tp, 0xb88e, 0xc02e);
+		ocp_reg_write(tp, 0xb890, 0xebe7);
+		ocp_reg_write(tp, 0xb88e, 0xc02f);
+		ocp_reg_write(tp, 0xb890, 0xebe7);
+		ocp_reg_write(tp, 0xb88e, 0xc030);
+		ocp_reg_write(tp, 0xb890, 0xe4e2);
+		ocp_reg_write(tp, 0xb88e, 0xc031);
+		ocp_reg_write(tp, 0xb890, 0xe4e2);
+		ocp_reg_write(tp, 0xb88e, 0xc032);
+		ocp_reg_write(tp, 0xb890, 0xdfdf);
+		ocp_reg_write(tp, 0xb88e, 0xc033);
+		ocp_reg_write(tp, 0xb890, 0xdfdf);
+		ocp_reg_write(tp, 0xb88e, 0xc034);
+		ocp_reg_write(tp, 0xb890, 0xdfdf);
+		ocp_reg_write(tp, 0xb88e, 0xc035);
+		ocp_reg_write(tp, 0xb890, 0xdfdf);
+		ocp_reg_write(tp, 0xb88e, 0xc036);
+		ocp_reg_write(tp, 0xb890, 0xdfdf);
+		ocp_reg_write(tp, 0xb88e, 0xc037);
+		ocp_reg_write(tp, 0xb890, 0xdfdf);
+		ocp_reg_write(tp, 0xb88e, 0xc038);
+		ocp_reg_write(tp, 0xb890, 0xdfdf);
+		ocp_reg_write(tp, 0xb88e, 0xc039);
+		ocp_reg_write(tp, 0xb890, 0xdfdf);
+		ocp_reg_write(tp, 0xb88e, 0xc03a);
+		ocp_reg_write(tp, 0xb890, 0xdfdf);
+		ocp_reg_write(tp, 0xb88e, 0xc03b);
+		ocp_reg_write(tp, 0xb890, 0xdfdf);
+		ocp_reg_write(tp, 0xb88e, 0xc03c);
+		ocp_reg_write(tp, 0xb890, 0xdf00);
+
+		data = ocp_reg_read(tp, 0xb896);
+		data |= BIT(0);
+		ocp_reg_write(tp, 0xb896, data);
+
+		r8153_pre_ram_code(tp, 0x8024, 0x0000);
+
+		data = ocp_reg_read(tp, 0xb820);
+		data |= BIT(7);
+		ocp_reg_write(tp, 0xb820, data);
+
+		/* nc0_patch_RLE0847_171220_loop_test_USB */
+		sram_write(tp, 0xA016, 0x0000);
+		sram_write(tp, 0xA012, 0x0000);
+		sram_write(tp, 0xA014, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8027);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x802e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8035);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x806d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8077);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x808c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8091);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x12ad);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd708);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3709);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8017);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3bdd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x801f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc100);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x38c0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1034);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4061);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb902);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x37b8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1034);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x12ad);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd71e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5fa6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x12ad);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1044);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x12ad);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd708);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3b0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1032);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x12ed);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x12ad);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd708);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2109);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1032);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x12e5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa130);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1a2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x401a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa140);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd020);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1a1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x401a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8120);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa8c0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd020);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1a1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x401a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8140);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd093);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1a5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x401a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa63f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1a2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x401a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa73f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd09e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1a2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x401a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa180);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd0dc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1a5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x401a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd502);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa401);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd03b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1c4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd704);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x401c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x617d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd502);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8401);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd503);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcdc7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaf01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd704);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4013);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0f7a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd502);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8401);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8280);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0f7a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd504);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8208);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcc08);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x08ba);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x08c6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0ee6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x068b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0e9d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd719);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x34a1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0da2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd704);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5f1c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd75e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3ffd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0dca);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd707);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5e67);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd719);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2f79);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0dc0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd75e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2a51);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0db6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xffec);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa540);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1308);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x159e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc445);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xdb02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c28);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0608);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c47);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0542);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd00a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x408d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd075);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6045);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd05d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1a4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd07a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1b5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0771);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3b4d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x809f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2635);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0241);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2745);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0241);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x27d0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x80aa);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ec8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc446);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xdb04);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa602);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd064);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1a1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd018);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1b0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x068b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd701);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0753);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x407b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0771);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2745);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0241);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x61da);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x608a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6306);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x80c5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5e28);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2730);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x80b1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x80c5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0771);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8103);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc447);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xdb08);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x406d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c07);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd056);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1c2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3ce1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x01ae);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2734);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x80c5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7f8a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c07);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd04e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1b2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd0a8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1a7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xdb08);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc447);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x26d7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8103);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x648a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5fbb);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0ca0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0320);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x80f0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa208);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc317);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2c51);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8103);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xdb10);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc448);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa620);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8710);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x41dd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd502);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa306);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x415f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa210);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c1f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0004);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa330);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc575);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8210);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd502);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8320);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa301);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2c59);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8103);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3a33);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x80ff);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd502);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8301);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd098);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd191);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x609f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8306);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8110);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa320);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa210);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd006);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1e3);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc30f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4093);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc033);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x02fb);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa0f0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8208);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x02fb);
+		sram_write(tp, 0xA026, 0x0279);
+		sram_write(tp, 0xA024, 0x159c);
+		sram_write(tp, 0xA022, 0x0d94);
+		sram_write(tp, 0xA020, 0x0ee1);
+		sram_write(tp, 0xA006, 0x0f46);
+		sram_write(tp, 0xA004, 0x12e2);
+		sram_write(tp, 0xA002, 0x12ea);
+		sram_write(tp, 0xA000, 0x1034);
+		sram_write(tp, 0xA008, 0xff00);
+
+		/* nc2_patch_RLE0847_171109_USB */
+		sram_write(tp, 0xA016, 0x0020);
+		sram_write(tp, 0xA012, 0x0000);
+		sram_write(tp, 0xA014, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8014);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8018);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8024);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8056);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8062);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8069);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8080);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa404);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8708);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0390);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd37a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd21a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0508);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8301);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd164);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd04d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0441);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5fb4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcf0c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0437);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x010c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcb60);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd71f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x61ee);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd71f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x210c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x001a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5f57);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbb80);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x605f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x9b80);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8301);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1c3);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd074);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa301);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfff1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcb62);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb910);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd71f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7fae);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x9930);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcb80);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8190);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x82a0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x800a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8406);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa780);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd141);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd040);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0441);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5fb4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcb82);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8701);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa70c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa190);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa2b4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa00a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa404);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6041);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa402);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0441);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5fa7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x02ed);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8301);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd164);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd04d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0441);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5fb4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0450);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb401);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0236);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb808);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbb80);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa301);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1c3);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd074);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x03f3);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcb17);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0441);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8ec0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0426);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae40);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0426);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cc0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0e80);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0426);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaec0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0426);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x34a0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x012c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd701);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5d8e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0134);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcb23);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0441);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8ec0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0426);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae40);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0426);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cc0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0e80);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0426);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaec0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0426);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd701);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5dee);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0249);
+		sram_write(tp, 0xA10E, 0x0239);
+		sram_write(tp, 0xA10C, 0x0119);
+		sram_write(tp, 0xA10A, 0x03f2);
+		sram_write(tp, 0xA108, 0x0231);
+		sram_write(tp, 0xA106, 0x0413);
+		sram_write(tp, 0xA104, 0x0108);
+		sram_write(tp, 0xA102, 0x0506);
+		sram_write(tp, 0xA100, 0x038e);
+		sram_write(tp, 0xA110, 0x00ff);
+
+		/* uc2_patch_RLE0847_171006_calc_txcrc_reg_write_seq_USB */
+		sram_write(tp, 0xb87c, 0x82c1);
+		sram_write(tp, 0xb87e, 0xaf82);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcdaf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x82d6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaf82);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd9af);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x82dc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0282);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xdc02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x830c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaf03);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd7af);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0eea);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaf0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe4f8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfaef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x69e0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8169);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xac23);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1ee0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x815d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xad23);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1bf7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0ee0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xffcf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xad26);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfa02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0b99);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0283);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3cf6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0ee0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xffcf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xac26);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfaae);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0302);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d70);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef96);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfefc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x04f8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfaef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x69e0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8169);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xac24);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1ee0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x815d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xad24);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1bf7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0ee0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xffcf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xad26);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfa02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8349);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0283);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3cf6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0ee0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xffcf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xac26);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfaae);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0302);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x861d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef96);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfefc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x04f8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf70f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe0ff);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcfad);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x27fa);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf60f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfc04);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf8f9);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfaef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x69e0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x81a3);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0502);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8375);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae16);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa001);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0502);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x83aa);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae0e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa002);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0502);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x848f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae06);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa003);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0302);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x857e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef96);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfefd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfc04);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf8f9);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfaef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x69e1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xad2b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x16ee);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x81a4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00ee);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x81a5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00ee);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x81a6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x01ee);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x81a7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x01ee);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x81a3);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x01ae);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0ee1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x815d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf62c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe581);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5dbf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8663);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0243);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5cef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x96fe);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfdfc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x04f8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf9fa);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef69);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe281);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa6e3);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x81a7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef13);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3905);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xac2f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1da2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0417);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0285);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf0e1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x815d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf62c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe581);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5dbf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8663);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0243);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5cee);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x81a3);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00ae);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4412);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd301);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0284);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x20e6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x81a6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe781);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa75d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0303);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef12);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c12);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1e13);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe281);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa4e3);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x81a5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5d03);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x030c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x260c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x341e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x121e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x13bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8666);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe8d1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x09bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8669);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe8bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x866c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0243);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5cbf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8675);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0243);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5cee);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x81a3);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x02ef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x96fe);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfdfc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x04f8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf9fa);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef69);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa201);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0abf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x867b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2cef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x64ae);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x22a2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x020a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7e02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3f2c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef64);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae15);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa203);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0abf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8681);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2cef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x64ae);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x08bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8684);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2cef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6483);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c64);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c32);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1a63);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf81);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa81a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x961f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x66ef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x563d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0004);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xad37);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1fd9);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef79);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6602);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3ee8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef16);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x290a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6902);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3ee8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6c02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x435c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef97);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1916);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaed9);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef96);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfefd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfc04);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf8f9);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfaef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x69bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8678);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2cad);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2879);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd103);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7202);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3ee8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6f02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3f2c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa094);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x62e2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x81a6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe381);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa7d1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x04bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8672);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe8bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x866f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2cef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x100d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x121f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1259);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x03a1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0043);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef10);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1f13);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5903);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa100);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3a02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x851c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe681);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa4e7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x81a5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5d03);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x03ef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x120c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x121e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x130c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x121e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x120c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x121e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x13bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8666);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe8d1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x09bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8669);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe8bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x866c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0243);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5cbf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8675);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0243);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5cee);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x81a3);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x03ae);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x06bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8675);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0243);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5cef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x96fe);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfdfc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x04f8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf9fa);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef69);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1f66);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8283);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c32);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef12);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8702);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3ee8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef46);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3c00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x02ad);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2741);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef46);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2c00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x05bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8672);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe8bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x866f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2cbf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x868a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe8ef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x13bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x868d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe8bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8690);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0243);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5cef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x10bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x868a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe8ef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1311);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8d02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3ee8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x9002);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x435c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2b02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x16ae);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb7ef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x96fe);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfdfc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x04f8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf9fa);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef69);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7802);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3f2c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xad28);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ee2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x81a6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe381);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa7d1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x03bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8672);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe8bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x866f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2cef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1259);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x03a1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0014);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef13);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5903);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa100);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0da0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x900a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x13e7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x81a7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xee81);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa301);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae2f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa094);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x26d1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x04bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8672);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe8bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x866f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2cef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x100d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x161f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1259);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x03a1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x000d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef10);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d14);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1f13);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5903);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa100);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x02ae);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcdbf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8675);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0243);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5cef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x96fe);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfdfc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x04f8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf9fa);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef69);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd209);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd100);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6602);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3ee8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef32);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3b0e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xad3f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x11ef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x12bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8669);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe8bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x866c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0243);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5c12);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaee8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef96);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfefd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfc04);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf8f9);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfaef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x69e1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xad2b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0602);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x85f0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0286);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x44e1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8169);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf62c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe581);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x69e1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x815d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf62c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe581);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5def);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x96fe);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfdfc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x04f8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf9fa);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef69);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xee81);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa400);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xee81);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xee81);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa601);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xee81);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa701);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xee81);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa300);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef96);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfefd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfc04);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x44a6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe070);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb468);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xdab4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x68ff);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb468);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf0b6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3a20);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb638);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xeeb6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x38ff);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb638);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x10b5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0032);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x54b5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0076);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x10b4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4e70);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb450);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x52b4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4e66);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb44e);
+		sram_write(tp, 0xb85e, 0x03d1);
+		sram_write(tp, 0xb860, 0x0ee4);
+		sram_write(tp, 0xb862, 0x0fde);
+		sram_write(tp, 0xb864, 0xffff);
+		sram_write(tp, 0xb878, 0x0001);
+
+		data = ocp_reg_read(tp, 0xb820);
+		data &= ~BIT(7);
+		ocp_reg_write(tp, 0xb820, data);
+
+		/* uc_patch_RLE0847_171212_customer_USB */
+		sram_write(tp, 0x8586, 0xaf85);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x92af);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8598);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaf85);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa1af);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x85a1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0285);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa1af);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0414);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0286);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7e02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1273);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaf10);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1cf8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf9e3);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x83ab);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe0a6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00e1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa601);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d04);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x580f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa008);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4659);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0f9e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4239);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0aab);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3ee0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xffcf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xad26);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07f7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0ead);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2729);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf60e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe283);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xab1f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x239f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x28e0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb714);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe1b7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x155c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x9fee);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0285);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfee0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xffcf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xad26);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0af7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0fe0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xffcf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xac27);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfaf6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0fe2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x83ab);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1f23);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x9f03);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaf85);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa6fd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfc04);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf8f9);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfb02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x866d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1f77);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe0b7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2ee1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb72f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0286);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4ce0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb72c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe1b7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2d02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x864c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe0b7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2ae1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb72b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0286);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4ce0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb728);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe1b7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2902);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x864c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe0b7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x26e1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb727);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0286);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4cef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x47d2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb8e6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb468);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe5b4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x69d2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbce6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb468);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe4b4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6902);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x866d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfffd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfc04);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf8f9);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfad2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00ef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x675e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0001);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1f46);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d71);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5f7f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xffad);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2803);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7fa0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x010d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4112);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa210);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe8fe);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfdfc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x04f8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe0b4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x62e1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb463);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6901);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe4b4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x62e5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb463);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfc04);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf8f9);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfaef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x69e1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8016);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xad2d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3bbf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86fd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x08ac);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2832);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0002);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3f08);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xad28);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x29d2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x03bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8703);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x023f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x080d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x11f6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2fef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x31e0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8ff3);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf627);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1b03);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaa01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x82e0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8ff2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf627);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1b03);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaa01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8202);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86ca);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef69);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfefd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfc04);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfbfa);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef69);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf9f8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf8f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf4e1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8fed);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1c21);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1a92);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe08f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xeee1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8fef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef74);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe08f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf0e1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8ff1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef64);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0217);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x70fc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfdef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x96fe);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xff04);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2087);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0620);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8709);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0087);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cbb);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa880);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xeea8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8070);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa880);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x60a8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x18e8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa818);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x60a8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1a00);
+		sram_write(tp, 0xb818, 0x040e);
+		sram_write(tp, 0xb81a, 0x1019);
+		sram_write(tp, 0xb81c, 0xffff);
+		sram_write(tp, 0xb81e, 0xffff);
+		sram_write(tp, 0xb832, 0x0003);
+
+		r8153_post_ram_code(tp, 0x8024);
+		ocp_reg_write(tp, 0xc414, 0x0200);
+
+		r8153_patch_request(tp, false);
+
+		r8156_lock_mian(tp, true);
+
+		sram_write(tp, 0x80c9, 0x3478);
+		sram_write(tp, 0x80d0, 0xfe8f);
+		sram_write(tp, 0x80ca, 0x7843);
+		sram_write(tp, 0x80cb, 0x43b0);
+		sram_write(tp, 0x80cb, 0x4380);
+		sram_write(tp, 0x80cc, 0xb00b);
+		sram_write(tp, 0x80cd, 0x0ba1);
+		sram_write(tp, 0x80d8, 0x1078);
+		sram_write(tp, 0x8016, 0x3f00);
+		sram_write(tp, 0x8fed, 0x0386);
+		sram_write(tp, 0x8fee, 0x86f4);
+		sram_write(tp, 0x8fef, 0xf486);
+		sram_write(tp, 0x8ff0, 0x86fd);
+		sram_write(tp, 0x8ff1, 0xfd28);
+		sram_write(tp, 0x8ff2, 0x285a);
+		sram_write(tp, 0x8ff3, 0x5a70);
+		sram_write(tp, 0x8ff4, 0x7000);
+		sram_write(tp, 0x8ff5, 0x005d);
+		sram_write(tp, 0x8ff6, 0x5d77);
+		sram_write(tp, 0x8ff7, 0x7778);
+		sram_write(tp, 0x8ff8, 0x785f);
+		sram_write(tp, 0x8ff9, 0x5f74);
+		sram_write(tp, 0x8ffa, 0x7478);
+		sram_write(tp, 0x8ffb, 0x7858);
+		sram_write(tp, 0x8ffc, 0x5870);
+		sram_write(tp, 0x8ffd, 0x7078);
+		sram_write(tp, 0x8ffe, 0x7850);
+		sram_write(tp, 0x8fff, 0x5000);
+		sram_write(tp, 0x80dd, 0x34a4);
+		sram_write(tp, 0x80e4, 0xfe7f);
+		sram_write(tp, 0x80e6, 0x4a19);
+		sram_write(tp, 0x80de, 0xa443);
+		sram_write(tp, 0x80df, 0x43a0);
+		sram_write(tp, 0x80df, 0x43a0);
+		sram_write(tp, 0x80e0, 0xa00a);
+		sram_write(tp, 0x80e1, 0x0a00);
+		sram_write(tp, 0x80e8, 0x700c);
+		sram_write(tp, 0x80e2, 0x0007);
+		sram_write(tp, 0x80e3, 0x07fe);
+		sram_write(tp, 0x80ec, 0x0e78);
+		sram_write(tp, 0x80b5, 0x42f7);
+		sram_write(tp, 0x80bc, 0xfaa4);
+		sram_write(tp, 0x80bf, 0x1f80);
+		sram_write(tp, 0x80be, 0xff1f);
+		sram_write(tp, 0x80b7, 0x4280);
+		sram_write(tp, 0x80b6, 0xf742);
+		sram_write(tp, 0x80b8, 0x800f);
+		sram_write(tp, 0x80b9, 0x0fab);
+		sram_write(tp, 0x80c1, 0x1e0a);
+		sram_write(tp, 0x80c0, 0x801e);
+		sram_write(tp, 0x80bd, 0xa4ff);
+		sram_write(tp, 0x80bb, 0x0bfa);
+		sram_write(tp, 0x80ba, 0xab0b);
+		ocp_reg_write(tp, OCP_SRAM_ADDR, 0x818d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x003d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x009b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00cb);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00e5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00f2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00f9);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00fd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00ff);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00c2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0065);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0034);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x001b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x000e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0007);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0003);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0002);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0001);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		sram_write(tp, 0x8163, 0xdb06);
+		sram_write(tp, 0x816a, 0xdb06);
+		sram_write(tp, 0x8171, 0xdb06);
+
+		r8156_lock_mian(tp, false);
+
+		r8153b_clear_bp(tp, MCU_TYPE_USB);
+
+		generic_ocp_write(tp, 0xe600, 0xff, sizeof(usb3_patch_t),
+				  usb3_patch_t, MCU_TYPE_USB);
+
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_BA, 0xa000);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_0, 0x033e);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_1, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_2, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_3, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_4, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_5, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_6, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_7, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_8, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_9, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_10, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_11, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_12, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_13, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_14, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_15, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP2_EN, 0x0001);
+	}
+}
+
 static void r8153_aldps_en(struct r8152 *tp, bool enable)
 {
 	u16 data;
@@ -5253,16 +7074,8 @@ static void r8153_aldps_en(struct r8152 *tp, bool enable)
 				break;
 		}
 	}
-}
 
-static void r8153b_aldps_en(struct r8152 *tp, bool enable)
-{
-	r8153_aldps_en(tp, enable);
-
-	if (enable)
-		r8153b_ups_flags_w1w0(tp, UPS_FLAGS_EN_ALDPS, 0);
-	else
-		r8153b_ups_flags_w1w0(tp, 0, UPS_FLAGS_EN_ALDPS);
+	tp->ups_info.aldps = enable;
 }
 
 static void r8153_eee_en(struct r8152 *tp, bool enable)
@@ -5283,22 +7096,24 @@ static void r8153_eee_en(struct r8152 *tp, bool enable)
 
 	ocp_write_word(tp, MCU_TYPE_PLA, PLA_EEE_CR, ocp_data);
 	ocp_reg_write(tp, OCP_EEE_CFG, config);
+
+	tp->ups_info.eee = enable;
 }
 
-static void r8153b_eee_en(struct r8152 *tp, bool enable)
+static void r8156_eee_en(struct r8152 *tp, bool enable)
 {
+	u16 config;
+
 	r8153_eee_en(tp, enable);
 
-	if (enable)
-		r8153b_ups_flags_w1w0(tp, UPS_FLAGS_EN_EEE, 0);
-	else
-		r8153b_ups_flags_w1w0(tp, 0, UPS_FLAGS_EN_EEE);
-}
+	config = ocp_reg_read(tp, 0xa6d4);
 
-static void r8153b_enable_fc(struct r8152 *tp)
-{
-	r8152b_enable_fc(tp);
-	r8153b_ups_flags_w1w0(tp, UPS_FLAGS_EN_FLOW_CTR, 0);
+	if (enable)
+		config |= BIT(0);
+	else
+		config &= ~BIT(0);
+
+	ocp_reg_write(tp, 0xa6d4, config);
 }
 
 static void r8153_hw_phy_cfg(struct r8152 *tp)
@@ -5344,8 +7159,10 @@ static void r8153_hw_phy_cfg(struct r8152 *tp)
 	sram_write(tp, SRAM_10M_AMP1, 0x00af);
 	sram_write(tp, SRAM_10M_AMP2, 0x0208);
 
-	r8153_eee_en(tp, true);
-	ocp_reg_write(tp, OCP_EEE_ADV, MDIO_EEE_1000T | MDIO_EEE_100TX);
+	if (tp->eee_en) {
+		r8153_eee_en(tp, true);
+		ocp_reg_write(tp, OCP_EEE_ADV, tp->eee_adv);
+	}
 
 	r8153_aldps_en(tp, true);
 	r8152b_enable_fc(tp);
@@ -5378,14 +7195,14 @@ static u32 r8152_efuse_read(struct r8152 *tp, u8 addr)
 
 static void r8153b_hw_phy_cfg(struct r8152 *tp)
 {
-	u32 ocp_data, ups_flags = 0;
+	u32 ocp_data;
 	u16 data;
 
 	/* disable ALDPS before updating the PHY parameters */
-	r8153b_aldps_en(tp, false);
+	r8153_aldps_en(tp, false);
 
 	/* disable EEE before updating the PHY parameters */
-	r8153b_eee_en(tp, false);
+	r8153_eee_en(tp, false);
 	ocp_reg_write(tp, OCP_EEE_ADV, 0);
 
 	/* r8153b_firmware(tp); */
@@ -5433,28 +7250,29 @@ static void r8153b_hw_phy_cfg(struct r8152 *tp)
 		data = ocp_reg_read(tp, OCP_POWER_CFG);
 		data |= EEE_CLKDIV_EN;
 		ocp_reg_write(tp, OCP_POWER_CFG, data);
+		tp->ups_info.eee_ckdiv = true;
 
 		data = ocp_reg_read(tp, OCP_DOWN_SPEED);
 		data |= EN_EEE_CMODE | EN_EEE_1000 | EN_10M_CLKDIV;
 		ocp_reg_write(tp, OCP_DOWN_SPEED, data);
+		tp->ups_info.eee_cmod_lv = true;
+		tp->ups_info._10m_ckdiv = true;
+		tp->ups_info.eee_plloff_giga = true;
 
 		ocp_reg_write(tp, OCP_SYSCLK_CFG, 0);
 		ocp_reg_write(tp, OCP_SYSCLK_CFG, clk_div_expo(5));
-
-		ups_flags |= UPS_FLAGS_EN_10M_CKDIV | UPS_FLAGS_250M_CKDIV |
-			     UPS_FLAGS_EN_EEE_CKDIV | UPS_FLAGS_EEE_CMOD_LV_EN |
-			     UPS_FLAGS_EEE_PLLOFF_GIGA;
+		tp->ups_info._250m_ckdiv = true;
 
 		r8153_patch_request(tp, false);
 	}
 
-	r8153b_ups_flags_w1w0(tp, ups_flags, 0);
+	if (tp->eee_en) {
+		r8153_eee_en(tp, true);
+		ocp_reg_write(tp, OCP_EEE_ADV, tp->eee_adv);
+	}
 
-	r8153b_eee_en(tp, true);
-	ocp_reg_write(tp, OCP_EEE_ADV, MDIO_EEE_1000T | MDIO_EEE_100TX);
-
-	r8153b_aldps_en(tp, true);
-	r8153b_enable_fc(tp);
+	r8153_aldps_en(tp, true);
+	r8152b_enable_fc(tp);
 	r8153_u2p3en(tp, true);
 
 	set_bit(PHY_RESET, &tp->flags);
@@ -5465,7 +7283,6 @@ static void r8153_first_init(struct r8152 *tp)
 	u32 ocp_data;
 	int i;
 
-	r8153_mac_clk_spd(tp, false);
 	rxdy_gated_en(tp, true);
 	r8153_teredo_off(tp);
 
@@ -5526,8 +7343,6 @@ static void r8153_enter_oob(struct r8152 *tp)
 {
 	u32 ocp_data;
 	int i;
-
-	r8153_mac_clk_spd(tp, true);
 
 	ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL);
 	ocp_data &= ~NOW_IS_OOB;
@@ -5605,18 +7420,72 @@ static void rtl8153_disable(struct r8152 *tp)
 	r8153_aldps_en(tp, true);
 }
 
-static void rtl8153b_disable(struct r8152 *tp)
+static int rtl8156_enable(struct r8152 *tp)
 {
-	r8153b_aldps_en(tp, false);
-	rtl_disable(tp);
-	rtl_reset_bmu(tp);
-	r8153b_aldps_en(tp, true);
+	u32 ocp_data;
+	u16 speed;
+
+	if (test_bit(RTL8152_UNPLUG, &tp->flags))
+		return -ENODEV;
+
+	set_tx_qlen(tp);
+	rtl_set_eee_plus(tp);
+	r8153_set_rx_early_timeout(tp);
+	r8153_set_rx_early_size(tp);
+
+	switch (tp->version) {
+	case RTL_TEST_01:
+		ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, 0xe95a);
+		ocp_data &= ~0xf;
+		ocp_data |= 5;
+		ocp_write_byte(tp, MCU_TYPE_PLA, 0xe95a, ocp_data);
+
+		ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, 0xe940);
+		ocp_data &= ~0x1f;
+		ocp_data |= 4;
+		ocp_write_byte(tp, MCU_TYPE_PLA, 0xe940, ocp_data);
+		break;
+	default:
+		break;
+	}
+
+	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_TCR1);
+	ocp_data &= ~(BIT(3) | BIT(9) | BIT(8));
+	speed = rtl8152_get_speed(tp);
+	if ((speed & (_10bps | _100bps)) && !(speed & FULL_DUP)) {
+		ocp_data |= BIT(9);
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_TCR1, ocp_data);
+
+		ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL4);
+		ocp_data &= ~BIT(8);
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL4, ocp_data);
+	} else {
+		ocp_data |= BIT(9) | BIT(8);
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_TCR1, ocp_data);
+
+		ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL4);
+		ocp_data |= BIT(8);
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL4, ocp_data);
+	}
+
+	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL4);
+	if (speed & _2500bps)
+		ocp_data &= ~BIT(6);
+	else
+		ocp_data |= BIT(6);
+	ocp_write_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL4, ocp_data);
+
+	if (speed & _1000bps)
+		ocp_write_byte(tp, MCU_TYPE_PLA, 0xe04c, 0x11);
+	else if (speed & _500bps)
+		ocp_write_byte(tp, MCU_TYPE_PLA, 0xe04c, 0x3d);
+
+	return rtl_enable(tp);
 }
 
 static int rtl8152_set_speed(struct r8152 *tp, u8 autoneg, u32 speed, u8 duplex,
 			     u32 advertising)
 {
-	enum spd_duplex speed_duplex;
 	u16 bmcr;
 	int ret = 0;
 
@@ -5627,16 +7496,26 @@ static int rtl8152_set_speed(struct r8152 *tp, u8 autoneg, u32 speed, u8 duplex,
 		switch (speed) {
 		case SPEED_10:
 			bmcr = BMCR_SPEED10;
-			speed_duplex = FORCE_10M_HALF;
+			if (duplex == DUPLEX_FULL) {
+				bmcr |= BMCR_FULLDPLX;
+				tp->ups_info.speed_duplex = FORCE_10M_FULL;
+			} else {
+				tp->ups_info.speed_duplex = FORCE_10M_HALF;
+			}
 			break;
 		case SPEED_100:
 			bmcr = BMCR_SPEED100;
-			speed_duplex = FORCE_100M_HALF;
+			if (duplex == DUPLEX_FULL) {
+				bmcr |= BMCR_FULLDPLX;
+				tp->ups_info.speed_duplex = FORCE_100M_FULL;
+			} else {
+				tp->ups_info.speed_duplex = FORCE_100M_HALF;
+			}
 			break;
 		case SPEED_1000:
 			if (tp->mii.supports_gmii) {
-				bmcr = BMCR_SPEED1000;
-				speed_duplex = NWAY_1000M_FULL;
+				bmcr = BMCR_SPEED1000 | BMCR_FULLDPLX;
+				tp->ups_info.speed_duplex = NWAY_1000M_FULL;
 				break;
 			}
 		default:
@@ -5644,24 +7523,28 @@ static int rtl8152_set_speed(struct r8152 *tp, u8 autoneg, u32 speed, u8 duplex,
 			goto out;
 		}
 
-		tp->mii.full_duplex = 0;
-		if (duplex == DUPLEX_FULL) {
-			bmcr |= BMCR_FULLDPLX;
+		if (duplex == DUPLEX_FULL)
 			tp->mii.full_duplex = 1;
-			if (speed != SPEED_1000)
-				speed_duplex++;
-		}
+		else
+			tp->mii.full_duplex = 0;
 
 		tp->mii.force_media = 1;
 	} else {
 		u16 anar, tmp1;
+		u32 support;
 
-		if ((advertising & (ADVERTISED_10baseT_Half |
-				    ADVERTISED_10baseT_Full |
-				    ADVERTISED_100baseT_Half |
-				    ADVERTISED_100baseT_Full |
-				    ADVERTISED_1000baseT_Half |
-				    ADVERTISED_1000baseT_Full)) == 0)
+		support = ADVERTISED_10baseT_Half | ADVERTISED_10baseT_Full |
+			  ADVERTISED_100baseT_Half |
+			  ADVERTISED_100baseT_Full;
+
+		if (tp->mii.supports_gmii) {
+			support |= ADVERTISED_1000baseT_Full;
+
+			if (test_bit(SUPPORT_2500FULL, &tp->flags))
+				support |= ADVERTISED_2500baseX_Full;
+		}
+
+		if (!(advertising & support))
 			return -EINVAL;
 
 		anar = r8152_mdio_read(tp, MII_ADVERTISE);
@@ -5669,20 +7552,20 @@ static int rtl8152_set_speed(struct r8152 *tp, u8 autoneg, u32 speed, u8 duplex,
 				ADVERTISE_100HALF | ADVERTISE_100FULL);
 		if (advertising & ADVERTISED_10baseT_Half) {
 			tmp1 |= ADVERTISE_10HALF;
-			speed_duplex = NWAY_10M_HALF;
+			tp->ups_info.speed_duplex = NWAY_10M_HALF;
 		}
 		if (advertising & ADVERTISED_10baseT_Full) {
 			tmp1 |= ADVERTISE_10FULL;
-			speed_duplex = NWAY_10M_FULL;
+			tp->ups_info.speed_duplex = NWAY_10M_FULL;
 		}
 
 		if (advertising & ADVERTISED_100baseT_Half) {
 			tmp1 |= ADVERTISE_100HALF;
-			speed_duplex = NWAY_100M_HALF;
+			tp->ups_info.speed_duplex = NWAY_100M_HALF;
 		}
 		if (advertising & ADVERTISED_100baseT_Full) {
 			tmp1 |= ADVERTISE_100FULL;
-			speed_duplex = NWAY_100M_FULL;
+			tp->ups_info.speed_duplex = NWAY_100M_FULL;
 		}
 
 		if (anar != tmp1) {
@@ -5699,15 +7582,24 @@ static int rtl8152_set_speed(struct r8152 *tp, u8 autoneg, u32 speed, u8 duplex,
 
 			if (advertising & ADVERTISED_1000baseT_Half) {
 				tmp2 |= ADVERTISE_1000HALF;
-				speed_duplex = NWAY_1000M_FULL;
+				tp->ups_info.speed_duplex = NWAY_1000M_FULL;
 			}
 			if (advertising & ADVERTISED_1000baseT_Full) {
 				tmp2 |= ADVERTISE_1000FULL;
-				speed_duplex = NWAY_1000M_FULL;
+				tp->ups_info.speed_duplex = NWAY_1000M_FULL;
 			}
 
 			if (gbcr != tmp2)
 				r8152_mdio_write(tp, MII_CTRL1000, tmp2);
+
+			gbcr = ocp_reg_read(tp, 0xa5d4);
+			tmp2 = gbcr & ~BIT(7);
+
+			if (advertising & ADVERTISED_2500baseX_Full)
+				tmp2 |= BIT(7);
+
+			if (gbcr != tmp2)
+				ocp_reg_write(tp, 0xa5d4, tmp2);
 		}
 
 		bmcr = BMCR_ANENABLE | BMCR_ANRESTART;
@@ -5719,17 +7611,6 @@ static int rtl8152_set_speed(struct r8152 *tp, u8 autoneg, u32 speed, u8 duplex,
 		bmcr |= BMCR_RESET;
 
 	r8152_mdio_write(tp, MII_BMCR, bmcr);
-
-	switch (tp->version) {
-	case RTL_VER_08:
-	case RTL_VER_09:
-		r8153b_ups_flags_w1w0(tp, ups_flags_speed(speed_duplex),
-				      UPS_FLAGS_SPEED_MASK);
-		break;
-
-	default:
-		break;
-	}
 
 	if (bmcr & BMCR_RESET) {
 		int i;
@@ -5748,17 +7629,18 @@ out:
 static bool rtl_speed_down(struct r8152 *tp)
 {
 	bool ret = false;
-	u16 bmcr;
 
 	if (test_bit(RTL8152_UNPLUG, &tp->flags))
 		return ret;
 
-	bmcr = r8152_mdio_read(tp, MII_BMCR);
+	if ((tp->saved_wolopts & WAKE_ANY) && !(tp->saved_wolopts & WAKE_PHY)) {
+		u16 bmcr;
 
-	if (tp->saved_wolopts & WAKE_ANY) {
+		bmcr = r8152_mdio_read(tp, MII_BMCR);
+
 		if (netif_carrier_ok(tp->netdev) && (bmcr & BMCR_ANENABLE) &&
 		    (r8152_mdio_read(tp, MII_EXPANSION) & EXPANSION_NWAY)) {
-			u16 anar, gbcr = 0, lpa;
+			u16 anar, gbcr = 0, lpa, gbcr2 = 0;
 
 			anar = r8152_mdio_read(tp, MII_ADVERTISE);
 			anar &= ~(ADVERTISE_10HALF | ADVERTISE_10FULL |
@@ -5768,6 +7650,10 @@ static bool rtl_speed_down(struct r8152 *tp)
 				gbcr = r8152_mdio_read(tp, MII_CTRL1000);
 				gbcr &= ~(ADVERTISE_1000FULL |
 					  ADVERTISE_1000HALF);
+				if (test_bit(SUPPORT_2500FULL, &tp->flags)) {
+					gbcr2 = ocp_reg_read(tp, 0xa5d4);
+					gbcr2 &= ~BIT(7);
+				}
 			}
 
 			lpa = r8152_mdio_read(tp, MII_LPA);
@@ -5777,15 +7663,14 @@ static bool rtl_speed_down(struct r8152 *tp)
 				anar |= ADVERTISE_10HALF | ADVERTISE_10FULL |
 					ADVERTISE_100HALF | ADVERTISE_100FULL;
 			} else {
-				anar |= ADVERTISE_10HALF | ADVERTISE_10FULL |
-					ADVERTISE_100HALF | ADVERTISE_100FULL;
-				if (tp->mii.supports_gmii)
-					gbcr |= ADVERTISE_1000FULL |
-						ADVERTISE_1000HALF;
+				goto out1;
 			}
 
-			if (tp->mii.supports_gmii)
+			if (tp->mii.supports_gmii) {
 				r8152_mdio_write(tp, MII_CTRL1000, gbcr);
+				if (test_bit(SUPPORT_2500FULL, &tp->flags))
+					ocp_reg_write(tp, 0xa5d4, gbcr2);
+			}
 
 			r8152_mdio_write(tp, MII_ADVERTISE, anar);
 			r8152_mdio_write(tp, MII_BMCR, bmcr | BMCR_ANRESTART);
@@ -5795,6 +7680,7 @@ static bool rtl_speed_down(struct r8152 *tp)
 		}
 	}
 
+out1:
 	return ret;
 }
 
@@ -5833,6 +7719,7 @@ static void rtl8153_up(struct r8152 *tp)
 	r8153_u1u2en(tp, false);
 	r8153_u2p3en(tp, false);
 	r8153_aldps_en(tp, false);
+	r8153_mac_clk_spd(tp, false);
 	r8153_first_init(tp);
 
 	if (!work_busy(&tp->hw_phy_work.work)) {
@@ -5864,6 +7751,7 @@ static void rtl8153_down(struct r8152 *tp)
 	r8153_u2p3en(tp, false);
 	r8153_power_cut_en(tp, false);
 	r8153_aldps_en(tp, false);
+	r8153_mac_clk_spd(tp, true);
 	r8153_enter_oob(tp);
 	r8153_aldps_en(tp, true);
 	rtl_speed_down(tp);
@@ -5876,13 +7764,13 @@ static void rtl8153b_up(struct r8152 *tp)
 
 	r8153b_u1u2en(tp, false);
 	r8153_u2p3en(tp, false);
-	r8153b_aldps_en(tp, false);
+	r8153_aldps_en(tp, false);
 
 	r8153_first_init(tp);
 	ocp_write_dword(tp, MCU_TYPE_USB, USB_RX_BUF_TH, RX_THR_B);
 
 	if (!work_busy(&tp->hw_phy_work.work)) {
-		r8153b_aldps_en(tp, true);
+		r8153_aldps_en(tp, true);
 		r8153_u2p3en(tp, true);
 	}
 
@@ -5899,9 +7787,132 @@ static void rtl8153b_down(struct r8152 *tp)
 	r8153b_u1u2en(tp, false);
 	r8153_u2p3en(tp, false);
 	r8153b_power_cut_en(tp, false);
-	r8153b_aldps_en(tp, false);
+	r8153_aldps_en(tp, false);
 	r8153_enter_oob(tp);
-	r8153b_aldps_en(tp, true);
+	r8153_aldps_en(tp, true);
+	rtl_speed_down(tp);
+}
+
+static void rtl8156_up(struct r8152 *tp)
+{
+	u32 ocp_data;
+
+	if (test_bit(RTL8152_UNPLUG, &tp->flags))
+		return;
+
+	r8153b_u1u2en(tp, false);
+	r8153_u2p3en(tp, false);
+	r8153_aldps_en(tp, false);
+
+	rxdy_gated_en(tp, true);
+	r8153_teredo_off(tp);
+
+	ocp_data = ocp_read_dword(tp, MCU_TYPE_PLA, PLA_RCR);
+	ocp_data &= ~RCR_ACPT_ALL;
+	ocp_write_dword(tp, MCU_TYPE_PLA, PLA_RCR, ocp_data);
+
+	ocp_write_byte(tp, MCU_TYPE_PLA, PLA_CR, 0);
+	rtl_reset_bmu(tp);
+
+	ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL);
+	ocp_data &= ~NOW_IS_OOB;
+	ocp_write_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL, ocp_data);
+
+	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_SFF_STS_7);
+	ocp_data &= ~MCU_BORW_EN;
+	ocp_write_word(tp, MCU_TYPE_PLA, PLA_SFF_STS_7, ocp_data);
+
+	rtl_rx_vlan_en(tp, tp->netdev->features & NETIF_F_HW_VLAN_CTAG_RX);
+
+	ocp_data = tp->netdev->mtu + VLAN_ETH_HLEN + ETH_FCS_LEN;
+	ocp_write_word(tp, MCU_TYPE_PLA, PLA_RMS, ocp_data);
+	ocp_write_byte(tp, MCU_TYPE_PLA, PLA_MTPS, MTPS_JUMBO);
+
+	/* share FIFO settings */
+	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, 0xc0a2);
+	ocp_data &= ~0xfff;
+	ocp_data |= 0x08;
+	ocp_write_word(tp, MCU_TYPE_PLA, 0xc0a2, ocp_data);
+
+	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, 0xc0a6);
+	ocp_data &= ~0xfff;
+	ocp_data |= 0x0100;
+	ocp_write_word(tp, MCU_TYPE_PLA, 0xc0a6, ocp_data);
+
+	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, 0xc0a8);
+	ocp_data &= ~0xfff;
+	ocp_data |= 0x0200;
+	ocp_write_word(tp, MCU_TYPE_PLA, 0xc0a8, ocp_data);
+
+	/* TX share fifo free credit full threshold */
+	ocp_write_dword(tp, MCU_TYPE_PLA, PLA_TXFIFO_CTRL, TXFIFO_THR_NORMAL2);
+
+	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL3);
+	ocp_data &= ~BIT(14);
+	ocp_write_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL3, ocp_data);
+
+//	ocp_data = ocp_read_word(tp, MCU_TYPE_USB, 0xd32a);
+//	ocp_data &= ~(BIT(8) | BIT(9));
+//	ocp_write_word(tp, MCU_TYPE_USB, 0xd32a, ocp_data);
+
+	ocp_write_dword(tp, MCU_TYPE_USB, USB_RX_BUF_TH, 0x00600400);
+
+	if (tp->saved_wolopts != __rtl_get_wol(tp)) {
+		netif_warn(tp, ifup, tp->netdev, "wol setting is changed\n");
+		__rtl_set_wol(tp, tp->saved_wolopts);
+	}
+
+	if (!work_busy(&tp->hw_phy_work.work)) {
+		r8153_aldps_en(tp, true);
+		r8153_u2p3en(tp, true);
+	}
+
+	r8153b_u1u2en(tp, true);
+}
+
+static void rtl8156_down(struct r8152 *tp)
+{
+	u32 ocp_data;
+
+	if (test_bit(RTL8152_UNPLUG, &tp->flags)) {
+		rtl_drop_queued_tx(tp);
+		return;
+	}
+
+	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL3);
+	ocp_data |= BIT(14);
+	ocp_write_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL3, ocp_data);
+
+	r8153b_u1u2en(tp, false);
+	r8153_u2p3en(tp, false);
+	r8153b_power_cut_en(tp, false);
+	r8153_aldps_en(tp, false);
+
+	ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL);
+	ocp_data &= ~NOW_IS_OOB;
+	ocp_write_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL, ocp_data);
+
+	rtl_disable(tp);
+	rtl_reset_bmu(tp);
+
+	/* Clear teredo wake event. bit[15:8] is the teredo wakeup
+	 * type. Set it to zero. bits[7:0] are the W1C bits about
+	 * the events. Set them to all 1 to clear them.
+	 */
+	ocp_write_word(tp, MCU_TYPE_PLA, PLA_TEREDO_WAKE_BASE, 0x00ff);
+
+	ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL);
+	ocp_data |= NOW_IS_OOB;
+	ocp_write_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL, ocp_data);
+
+	rtl_rx_vlan_en(tp, true);
+	rxdy_gated_en(tp, false);
+
+	ocp_data = ocp_read_dword(tp, MCU_TYPE_PLA, PLA_RCR);
+	ocp_data |= RCR_APM | RCR_AM | RCR_AB;
+	ocp_write_dword(tp, MCU_TYPE_PLA, PLA_RCR, ocp_data);
+
+	r8153_aldps_en(tp, true);
 	rtl_speed_down(tp);
 }
 
@@ -5935,7 +7946,7 @@ static void set_carrier(struct r8152 *tp)
 {
 	struct net_device *netdev = tp->netdev;
 	struct napi_struct *napi = &tp->napi;
-	u8 speed;
+	u16 speed;
 
 	speed = rtl8152_get_speed(tp);
 
@@ -6238,6 +8249,7 @@ static void r8152b_init(struct r8152 *tp)
 	}
 
 	r8152_power_cut_en(tp, false);
+	rtl_runtime_suspend_enable(tp, false);
 
 	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_PHY_PWR);
 	ocp_data |= TX_10M_IDLE_EN | PFM_PWM_SWITCH;
@@ -6355,6 +8367,7 @@ static void r8153_init(struct r8152 *tp)
 	ocp_write_word(tp, MCU_TYPE_USB, USB_CONNECT_TIMER, 0x0001);
 
 	r8153_power_cut_en(tp, false);
+	rtl_runtime_suspend_enable(tp, false);
 	r8153_u1u2en(tp, true);
 	r8153_mac_clk_spd(tp, false);
 	usb_enable_lpm(tp->udev);
@@ -6441,6 +8454,2130 @@ static void r8153b_init(struct r8152 *tp)
 	ocp_data = ocp_read_word(tp, MCU_TYPE_USB, USB_USB_CTRL);
 	ocp_data &= ~(RX_AGG_DISABLE | RX_ZERO_EN);
 	ocp_write_word(tp, MCU_TYPE_USB, USB_USB_CTRL, ocp_data);
+
+	rtl_tally_reset(tp);
+
+	tp->coalesce = 15000;	/* 15 us */
+}
+
+static void r8156_patch_code(struct r8152 *tp)
+{
+	if (tp->version == RTL_TEST_01) {
+		static u8 usb3_patch_t[] = {
+			0x01, 0xe0, 0x05, 0xc7,
+			0xf6, 0x65, 0x02, 0xc0,
+			0x00, 0xb8, 0x40, 0x03,
+			0x00, 0xd4, 0x00, 0x00 };
+
+		r8153b_clear_bp(tp, MCU_TYPE_USB);
+
+		generic_ocp_write(tp, 0xe600, 0xff, sizeof(usb3_patch_t),
+				  usb3_patch_t, MCU_TYPE_USB);
+
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_BA, 0xa000);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_0, 0x033e);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_1, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_2, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_3, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_4, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_5, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_6, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_7, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_8, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_9, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_10, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_11, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_12, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_13, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_14, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_15, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP2_EN, 0x0001);
+
+	} else if (tp->version == RTL_VER_11) {
+		u32 ocp_data;
+		static u8 usb_patch11[] = {
+			0x05, 0xe0, 0x23, 0xe0,
+			0x69, 0xe0, 0x78, 0xe0,
+			0x89, 0xe0, 0x1b, 0xc3,
+			0x60, 0x70, 0x17, 0xc4,
+			0x88, 0x98, 0x14, 0xc0,
+			0x8c, 0x98, 0x83, 0x18,
+			0x8e, 0x88, 0x8e, 0x70,
+			0x8f, 0x49, 0xfe, 0xf1,
+			0x62, 0x70, 0x8a, 0x98,
+			0x0d, 0xc0, 0x8c, 0x98,
+			0x84, 0x18, 0x8e, 0x88,
+			0x8e, 0x70, 0x8f, 0x49,
+			0xfe, 0xf1, 0x08, 0xc3,
+			0x02, 0xc4, 0x00, 0xbc,
+			0x68, 0x0f, 0x6c, 0xe9,
+			0x00, 0xdc, 0x50, 0xe8,
+			0x30, 0xc1, 0x36, 0xd3,
+			0x80, 0x10, 0x00, 0x00,
+			0x44, 0xc2, 0x4a, 0x41,
+			0x94, 0x20, 0x42, 0xc0,
+			0x16, 0x00, 0x00, 0x73,
+			0x40, 0xc4, 0x5c, 0x41,
+			0x8b, 0x41, 0x0b, 0x18,
+			0x38, 0xc6, 0xc0, 0x88,
+			0xc1, 0x99, 0x21, 0xe8,
+			0x35, 0xc0, 0x00, 0x73,
+			0xbd, 0x48, 0x0d, 0x18,
+			0x30, 0xc6, 0xc0, 0x88,
+			0xc1, 0x9b, 0x19, 0xe8,
+			0x2d, 0xc0, 0x02, 0x73,
+			0x35, 0x48, 0x0e, 0x18,
+			0x28, 0xc6, 0xc0, 0x88,
+			0xc1, 0x9b, 0x11, 0xe8,
+			0xe1, 0xc3, 0xdf, 0xc6,
+			0x01, 0x03, 0x1e, 0x40,
+			0xfe, 0xf1, 0x20, 0xc0,
+			0x02, 0x73, 0xb5, 0x48,
+			0x0e, 0x18, 0x1b, 0xc6,
+			0xc0, 0x88, 0xc1, 0x9b,
+			0x04, 0xe8, 0x02, 0xc6,
+			0x00, 0xbe, 0xb6, 0x10,
+			0x00, 0xb4, 0x01, 0xb4,
+			0x02, 0xb4, 0x03, 0xb4,
+			0x10, 0xc3, 0x0e, 0xc2,
+			0x61, 0x71, 0x40, 0x99,
+			0x60, 0x60, 0x0e, 0x48,
+			0x42, 0x98, 0x42, 0x70,
+			0x8e, 0x49, 0xfe, 0xf1,
+			0x03, 0xb0, 0x02, 0xb0,
+			0x01, 0xb0, 0x00, 0xb0,
+			0x80, 0xff, 0xc0, 0xd4,
+			0x8f, 0xcb, 0xaa, 0xc7,
+			0x1e, 0x00, 0x90, 0xc7,
+			0x1f, 0xfe, 0x0a, 0x10,
+			0x0c, 0xf0, 0x0b, 0x10,
+			0x0a, 0xf0, 0x0d, 0x10,
+			0x08, 0xf0, 0x0e, 0x10,
+			0x06, 0xf0, 0x24, 0x10,
+			0x04, 0xf0, 0x02, 0xc7,
+			0x00, 0xbf, 0x58, 0x11,
+			0x02, 0xc7, 0x00, 0xbf,
+			0x62, 0x11, 0xec, 0xc0,
+			0x02, 0x75, 0xd5, 0x48,
+			0x0e, 0x18, 0xe7, 0xc6,
+			0xc0, 0x88, 0xc1, 0x9d,
+			0xd0, 0xef, 0x02, 0x75,
+			0x55, 0x48, 0x0e, 0x18,
+			0xe0, 0xc6, 0xc0, 0x88,
+			0xc1, 0x9d, 0xc9, 0xef,
+			0x02, 0xc7, 0x00, 0xbf,
+			0x8e, 0x11, 0x16, 0xc0,
+			0xbb, 0x21, 0xb9, 0x21,
+			0x00, 0x71, 0x13, 0xc2,
+			0x4a, 0x41, 0x8b, 0x41,
+			0x24, 0x18, 0xd1, 0xc6,
+			0xc0, 0x88, 0xc1, 0x99,
+			0xba, 0xef, 0x0a, 0xc0,
+			0x08, 0x71, 0x28, 0x18,
+			0xca, 0xc6, 0xc0, 0x88,
+			0xc1, 0x99, 0xb3, 0xef,
+			0x02, 0xc0, 0x00, 0xb8,
+			0x3c, 0x11, 0xd8, 0xc7,
+			0x83, 0xff, 0x00, 0x00};
+		static u8 pla_patch11[] = {
+			0x02, 0xe0, 0x07, 0xe0,
+			0x05, 0xc2, 0x40, 0x76,
+			0x02, 0xc4, 0x00, 0xbc,
+			0xd6, 0x0b, 0x1e, 0xfc,
+			0x2a, 0xc5, 0xa0, 0x77,
+			0x2a, 0xc5, 0x2b, 0xc4,
+			0xa0, 0x9c, 0x26, 0xc5,
+			0xa0, 0x64, 0x01, 0x14,
+			0x0b, 0xf0, 0x02, 0x14,
+			0x09, 0xf0, 0x01, 0x07,
+			0xf1, 0x49, 0x06, 0xf0,
+			0x21, 0xc7, 0xe0, 0x8e,
+			0x11, 0x1e, 0xe0, 0x8e,
+			0x14, 0xe0, 0x17, 0xc5,
+			0x00, 0x1f, 0xa0, 0x9f,
+			0x13, 0xc5, 0xa0, 0x77,
+			0xa0, 0x74, 0x46, 0x48,
+			0x47, 0x48, 0xa0, 0x9c,
+			0x11, 0xc5, 0xa0, 0x74,
+			0x44, 0x48, 0x43, 0x48,
+			0xa0, 0x9c, 0x08, 0xc5,
+			0xa0, 0x9f, 0x02, 0xc5,
+			0x00, 0xbd, 0xea, 0x03,
+			0x02, 0xc5, 0x00, 0xbd,
+			0xf6, 0x03, 0x1c, 0xe8,
+			0xaa, 0xd3, 0x08, 0xb7,
+			0x6c, 0xe8, 0x20, 0xe8,
+			0x00, 0xa0, 0x38, 0xe4};
+
+		r8153b_clear_bp(tp, MCU_TYPE_USB);
+
+		generic_ocp_write(tp, 0xe600, 0xff, sizeof(usb_patch11),
+				  usb_patch11, MCU_TYPE_USB);
+
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_BA, 0xa000);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_0, 0x0f66);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_1, 0x1098);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_2, 0x1148);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_3, 0x116c);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_4, 0x10e0);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_5, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_6, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_7, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_8, 0x0000);
+//		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_9, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_10, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_11, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_12, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_13, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_14, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP_15, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_USB, USB_BP2_EN, 0x001f);
+
+		ocp_data = ocp_read_word(tp, MCU_TYPE_USB, 0xcfcc);
+		ocp_data &= ~BIT(9);
+		ocp_write_word(tp, MCU_TYPE_USB, 0xcfcc, ocp_data);
+
+		r8153b_clear_bp(tp, MCU_TYPE_PLA);
+
+		generic_ocp_write(tp, 0xf800, 0xff, sizeof(pla_patch11),
+				  pla_patch11, MCU_TYPE_PLA);
+
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_BP_BA, 0x8000);
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_BP_0, 0x0bc2);
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_BP_1, 0x03e0);
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_BP_2, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_BP_3, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_BP_4, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_BP_5, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_BP_6, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_BP_7, 0x0000);
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_BP_EN, 0x0003);
+	}
+}
+
+static void r8156_ram_code(struct r8152 *tp)
+{
+	u16 data;
+
+	if (tp->version == RTL_VER_10) {
+		r8153_pre_ram_code(tp, 0x8024, 0x8600);
+
+		data = ocp_reg_read(tp, 0xb820);
+		data |= BIT(7);
+		ocp_reg_write(tp, 0xb820, data);
+
+		/* nc0_patch_6486_180504_usb */
+		sram_write(tp, 0xA016, 0x0000);
+		sram_write(tp, 0xA012, 0x0000);
+		sram_write(tp, 0xA014, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8013);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8021);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x802f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x803d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8042);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8051);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8051);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa088);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0a50);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8008);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd014);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1a3);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x401a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd707);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x40c2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x60a6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5f8b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0a86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0a6c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8080);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd019);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1a2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x401a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd707);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x40c4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x60a6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5f8b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0a86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0a84);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd503);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8970);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c07);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0901);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcf09);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd705);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xceff);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaf0a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd504);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1213);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8401);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8580);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1253);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd064);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd181);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd704);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4018);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd504);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc50f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd706);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2c59);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x804d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc60f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf002);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc605);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x10fd);
+		sram_write(tp, 0xA026, 0xffff);
+		sram_write(tp, 0xA024, 0xffff);
+		sram_write(tp, 0xA022, 0x10f4);
+		sram_write(tp, 0xA020, 0x1252);
+		sram_write(tp, 0xA006, 0x1206);
+		sram_write(tp, 0xA004, 0x0a78);
+		sram_write(tp, 0xA002, 0x0a60);
+		sram_write(tp, 0xA000, 0x0a4f);
+		sram_write(tp, 0xA008, 0x3f00);
+
+		/* nc1_patch_6486_180423_cml_usb */
+		sram_write(tp, 0xA016, 0x0010);
+		sram_write(tp, 0xA012, 0x0000);
+		sram_write(tp, 0xA014, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8066);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x807c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8089);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x808e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x80a0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x80b2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x80c2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x62db);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x655c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd73e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x60e9);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x614a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x61ab);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0304);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0503);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0304);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0505);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0304);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0509);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0304);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x653c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd73e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x60e9);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x614a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x61ab);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0503);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0304);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0502);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0304);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0506);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0304);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x050a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0304);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd73e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x60e9);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x614a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x61ab);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0505);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0304);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0506);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0304);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0504);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0304);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x050c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0304);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd73e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x60e9);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x614a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x61ab);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0509);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0304);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x050a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0304);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x050c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0304);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0508);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0304);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd73e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x60e9);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x614a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x61ab);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0321);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0502);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0321);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0504);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0321);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0508);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0321);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0346);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8208);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x609d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa50f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x001a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0503);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x001a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x607d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00ab);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00ab);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x60fd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa50f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaa0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x017b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0503);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0a05);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x017b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x60fd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa50f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaa0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x01e0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0503);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0a05);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x01e0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x60fd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa50f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaa0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0231);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0503);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0a05);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0231);
+		sram_write(tp, 0xA08E, 0xffff);
+		sram_write(tp, 0xA08C, 0x0221);
+		sram_write(tp, 0xA08A, 0x01ce);
+		sram_write(tp, 0xA088, 0x0169);
+		sram_write(tp, 0xA086, 0x00a6);
+		sram_write(tp, 0xA084, 0x000d);
+		sram_write(tp, 0xA082, 0x0308);
+		sram_write(tp, 0xA080, 0x029f);
+		sram_write(tp, 0xA090, 0x007f);
+
+		/* nc2_patch_6486_180508_usb */
+		sram_write(tp, 0xA016, 0x0020);
+		sram_write(tp, 0xA012, 0x0000);
+		sram_write(tp, 0xA014, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8017);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x801b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8029);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8054);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x805a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8064);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x80a7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x9430);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x9480);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb408);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd120);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd057);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x064b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcb80);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x9906);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0567);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcb94);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8190);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x82a0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x800a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8406);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa740);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8dff);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07e4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa840);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0773);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcb91);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4063);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd139);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf002);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd140);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd040);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb404);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07dc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa610);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa110);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa2a0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa404);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd704);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4045);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa180);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd704);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x405d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa720);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0742);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07ec);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5f74);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0742);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd702);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7fb6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8190);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x82a0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8404);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8610);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07dc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x064b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07c0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5fa7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0481);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x94bc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x870c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa190);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa00a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa280);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa404);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8220);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x078e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcb92);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa840);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4063);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd140);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf002);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd150);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd040);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd703);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x60a0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6121);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x61a2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6223);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf02f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cf0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d10);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa740);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf00f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cf0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d20);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa740);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf00a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cf0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d30);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa740);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf005);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cf0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d40);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa740);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07e4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa610);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa008);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd704);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4046);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa002);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd704);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x405d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa720);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0742);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07f7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5f74);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0742);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd702);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7fb5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x800a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cf0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07e4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa740);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd701);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3ad4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0537);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8610);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8840);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x064b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8301);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x800a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8190);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x82a0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8404);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa70c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x9402);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x890c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8840);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x064b);
+		sram_write(tp, 0xA10E, 0x0642);
+		sram_write(tp, 0xA10C, 0x0686);
+		sram_write(tp, 0xA10A, 0x0788);
+		sram_write(tp, 0xA108, 0x047b);
+		sram_write(tp, 0xA106, 0x065c);
+		sram_write(tp, 0xA104, 0x0769);
+		sram_write(tp, 0xA102, 0x0565);
+		sram_write(tp, 0xA100, 0x06f9);
+		sram_write(tp, 0xA110, 0x00ff);
+
+		/* uc2_patch_6486_180507_usb */
+		sram_write(tp, 0xb87c, 0x8530);
+		sram_write(tp, 0xb87e, 0xaf85);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3caf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8593);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaf85);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x9caf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x85a5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd702);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5afb);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe083);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfb0c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x020d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x021b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x10bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86d7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb7bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86da);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfbe0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x83fc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1b10);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xda02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xdd02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5afb);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe083);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfd0c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x020d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x021b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x10bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86dd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb7bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86e0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfbe0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x83fe);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1b10);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe002);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaf2f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbd02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2cac);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0286);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x65af);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x212b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x022c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6002);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86b6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaf21);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cd1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x03bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8710);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb7bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x870d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb7bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8719);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb7bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8716);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb7bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x871f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb7bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x871c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb7bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8728);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb7bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8725);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb7bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8707);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfbad);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x281c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd100);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0a02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1302);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2202);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2b02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae1a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd101);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0a02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1302);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2202);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2b02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd101);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3402);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3102);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3d02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3a02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4302);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4002);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4c02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4902);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd100);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2e02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3702);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4602);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf87);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4f02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ab7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaf35);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7ff8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfaef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x69bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86e3);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfbbf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86fb);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb7bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86e6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfbbf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86fe);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb7bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86e9);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfbbf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8701);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb7bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86ec);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfbbf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8704);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x025a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb7bf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86ef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0262);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7cbf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86f2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0262);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7cbf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86f5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0262);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7cbf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x86f8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0262);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7cef);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x96fe);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfc04);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf8fa);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef69);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6273);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf202);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6273);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf502);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6273);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbf86);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf802);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6273);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef96);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfefc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0420);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb540);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x53b5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4086);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb540);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb9b5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x40c8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb03a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc8b0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbac8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb13a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc8b1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xba77);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbd26);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xffbd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2677);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbd28);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xffbd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2840);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbd26);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc8bd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x2640);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbd28);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc8bd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x28bb);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa430);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x98b0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1eba);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb01e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xdcb0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1e98);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb09e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbab0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x9edc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb09e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x98b1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1eba);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb11e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xdcb1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1e98);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb19e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbab1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x9edc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb19e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x11b0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1e22);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb01e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x33b0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1e11);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb09e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x22b0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x9e33);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb09e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x11b1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1e22);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb11e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x33b1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1e11);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb19e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x22b1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x9e33);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb19e);
+		sram_write(tp, 0xb85e, 0x2f71);
+		sram_write(tp, 0xb860, 0x20d9);
+		sram_write(tp, 0xb862, 0x2109);
+		sram_write(tp, 0xb864, 0x34e7);
+		sram_write(tp, 0xb878, 0x000f);
+
+		data = ocp_reg_read(tp, 0xb820);
+		data &= ~BIT(7);
+		ocp_reg_write(tp, 0xb820, data);
+
+		r8153_post_ram_code(tp, 0x8024);
+	} else if (tp->version == RTL_VER_11) {
+		r8153_pre_ram_code(tp, 0x8024, 0x8601);
+
+		data = ocp_reg_read(tp, 0xb820);
+		data |= BIT(7);
+		ocp_reg_write(tp, 0xb820, data);
+
+		/* nc_patch */
+		sram_write(tp, 0xA016, 0x0000);
+		sram_write(tp, 0xA012, 0x0000);
+		sram_write(tp, 0xA014, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x808b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x808f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8093);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8097);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x809d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x80a1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x80a4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd718);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x607b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x40da);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf00e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x42da);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf01e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd718);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x615b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1456);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x14a4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x14bc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd718);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5f2e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf01c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1456);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x14a4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x14bc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd718);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5f2e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf024);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1456);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x14a4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x14bc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd718);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5f2e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf02c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1456);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x14a4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x14bc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd718);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5f2e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf034);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd719);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4118);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd504);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xac11);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa410);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4779);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd504);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xac0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1444);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf034);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd719);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4118);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd504);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xac22);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa420);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4559);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd504);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xac0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1444);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf023);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd719);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4118);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd504);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xac44);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa440);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4339);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd504);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xac0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1444);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf012);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd719);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4118);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd504);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xac88);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa480);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xce00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4119);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd504);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xac0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1444);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf001);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1456);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd718);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5fac);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc48f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x141b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd504);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x121a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd0b4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1bb);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0898);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd0b4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1bb);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0a0e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd064);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd18a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0b7e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x401c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd501);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa804);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8804);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x053b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd500);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa301);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0648);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc306);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x15f8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0308);
+		sram_write(tp, 0xA026, 0x0307);
+		sram_write(tp, 0xA024, 0x15f7);
+		sram_write(tp, 0xA022, 0x0647);
+		sram_write(tp, 0xA020, 0x053a);
+		sram_write(tp, 0xA006, 0x0b7c);
+		sram_write(tp, 0xA004, 0x0a0c);
+		sram_write(tp, 0xA002, 0x0896);
+		sram_write(tp, 0xA000, 0x11a1);
+		sram_write(tp, 0xA008, 0xff00);
+
+		/* nc1_patch */
+		sram_write(tp, 0xA016, 0x0010);
+		sram_write(tp, 0xA012, 0x0000);
+		sram_write(tp, 0xA014, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8015);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x801a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x801a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x801a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x801a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x801a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x801a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xad02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x02d7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00ed);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0509);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xc100);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x008f);
+		sram_write(tp, 0xA08E, 0xffff);
+		sram_write(tp, 0xA08C, 0xffff);
+		sram_write(tp, 0xA08A, 0xffff);
+		sram_write(tp, 0xA088, 0xffff);
+		sram_write(tp, 0xA086, 0xffff);
+		sram_write(tp, 0xA084, 0xffff);
+		sram_write(tp, 0xA082, 0x008d);
+		sram_write(tp, 0xA080, 0x00eb);
+		sram_write(tp, 0xA090, 0x0103);
+
+		/* nc2_patch */
+		sram_write(tp, 0xA016, 0x0020);
+		sram_write(tp, 0xA012, 0x0000);
+		sram_write(tp, 0xA014, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8014);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8018);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8024);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8051);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8055);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8072);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x80dc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfffd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfffd);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8301);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x800a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8190);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x82a0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8404);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa70c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x9402);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x890c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8840);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa380);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x066e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcb91);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4063);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd139);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf002);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd140);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd040);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb404);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07e0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa610);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa110);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa2a0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa404);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd704);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4085);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa180);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa404);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8280);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd704);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x405d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa720);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0743);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07f0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5f74);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0743);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd702);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7fb6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8190);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x82a0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8404);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8610);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0c0f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07e0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x066e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd158);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd04d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x03d4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x94bc);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x870c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8380);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd10d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd040);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07c4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5fb4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa190);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa00a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa280);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa404);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa220);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd130);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd040);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07c4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5fb4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xbb80);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1c4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd074);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa301);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd704);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x604b);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa90c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0556);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xcb92);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4063);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd116);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf002);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd119);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd040);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd703);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x60a0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6241);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x63e2);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6583);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf054);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd701);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x611e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd701);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x40da);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cf0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d10);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8740);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf02f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cf0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d50);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa740);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf02a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd701);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x611e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd701);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x40da);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cf0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d20);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8740);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf021);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cf0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d60);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa740);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf01c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd701);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x611e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd701);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x40da);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cf0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d30);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8740);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf013);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cf0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d70);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa740);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf00e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd701);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x611e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd701);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x40da);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cf0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d40);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8740);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf005);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cf0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d80);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa740);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07e8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa610);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd704);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x405d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa720);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd700);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x5ff4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa008);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd704);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x4046);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa002);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0743);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07fb);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd703);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7f6f);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7f4e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7f2d);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7f0c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x800a);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0cf0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0d00);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07e8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8010);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa740);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0743);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd702);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x7fb5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd701);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3ad4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0556);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8610);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x066e);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd1f5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xd049);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x1800);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x01ec);
+		sram_write(tp, 0xA10E, 0x01ea);
+		sram_write(tp, 0xA10C, 0x06a9);
+		sram_write(tp, 0xA10A, 0x078a);
+		sram_write(tp, 0xA108, 0x03d2);
+		sram_write(tp, 0xA106, 0x067f);
+		sram_write(tp, 0xA104, 0x0665);
+		sram_write(tp, 0xA102, 0x0000);
+		sram_write(tp, 0xA100, 0x0000);
+		sram_write(tp, 0xA110, 0x00fc);
+
+		/* uc2 */
+		sram_write(tp, 0xb87c, 0x8530);
+		sram_write(tp, 0xb87e, 0xaf85);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x3caf);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8545);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaf85);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x45af);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8545);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xee82);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xf900);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0103);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xaf03);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb7f8);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe0a6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00e1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa601);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xef01);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x58f0);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa080);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x37a1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8402);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae16);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa185);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x02ae);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x11a1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8702);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae0c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xa188);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x02ae);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x07a1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x8902);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae02);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xae1c);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe0b4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x62e1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb463);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6901);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe4b4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x62e5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb463);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe0b4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x62e1);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb463);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x6901);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xe4b4);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x62e5);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xb463);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0xfc04);
+		sram_write(tp, 0xb85e, 0x03b3);
+		sram_write(tp, 0xb860, 0xffff);
+		sram_write(tp, 0xb862, 0xffff);
+		sram_write(tp, 0xb864, 0xffff);
+		sram_write(tp, 0xb878, 0x0001);
+
+		data = ocp_reg_read(tp, 0xb820);
+		data &= ~BIT(7);
+		ocp_reg_write(tp, 0xb820, data);
+
+		r8153_post_ram_code(tp, 0x8024);
+	}
+}
+
+static void r8156_hw_phy_cfg2(struct r8152 *tp)
+{
+	bool pcut_entr;
+	u32 ocp_data;
+	u16 data;
+
+	ocp_data = ocp_read_word(tp, MCU_TYPE_USB, USB_MISC_0);
+	pcut_entr = (ocp_data & PCUT_STATUS) ? true : false;
+	if (pcut_entr) {
+		ocp_data &= ~PCUT_STATUS;
+		ocp_write_word(tp, MCU_TYPE_USB, USB_MISC_0, ocp_data);
+
+		data = r8153_phy_status(tp, PHY_STAT_EXT_INIT);
+		WARN_ON_ONCE(data != PHY_STAT_EXT_INIT);
+
+		r8156_ram_code(tp);
+
+		data = ocp_reg_read(tp, 0xa468);
+		data &= ~(BIT(3) | BIT(0));
+		ocp_reg_write(tp, 0xa468, data);
+	} else {
+		r8156_patch_code(tp);
+
+		if (r8153_patch_request(tp, true)) {
+			netif_err(tp, drv, tp->netdev,
+				  "patch request error\n");
+			return;
+		}
+
+		r8156_ram_code(tp);
+
+		r8153_patch_request(tp, false);
+
+		/* disable ALDPS before updating the PHY parameters */
+		r8153_aldps_en(tp, false);
+
+		/* disable EEE before updating the PHY parameters */
+		r8153_eee_en(tp, false);
+		ocp_reg_write(tp, OCP_EEE_ADV, 0);
+	}
+
+	data = r8153_phy_status(tp, PHY_STAT_LAN_ON);
+	WARN_ON_ONCE(data != PHY_STAT_LAN_ON);
+
+	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_PHY_PWR);
+	ocp_data |= PFM_PWM_SWITCH;
+	ocp_write_word(tp, MCU_TYPE_PLA, PLA_PHY_PWR, ocp_data);
+
+	switch (tp->version) {
+	case RTL_VER_10:
+		data = ocp_reg_read(tp, 0xad40);
+		data &= ~0x3ff;
+		data |= BIT(7) | BIT(2);
+		ocp_reg_write(tp, 0xad40, data);
+
+		data = ocp_reg_read(tp, 0xad4e);
+		data |= BIT(4);
+		ocp_reg_write(tp, 0xad4e, data);
+		data = ocp_reg_read(tp, 0xad16);
+		data &= ~0x3ff;
+		data |= 0x6;
+		ocp_reg_write(tp, 0xad16, data);
+		data = ocp_reg_read(tp, 0xad32);
+		data &= ~0x3f;
+		data |= 6;
+		ocp_reg_write(tp, 0xad32, data);
+		data = ocp_reg_read(tp, 0xac08);
+		data &= ~(BIT(12) | BIT(8));
+		ocp_reg_write(tp, 0xac08, data);
+		data = ocp_reg_read(tp, 0xac8a);
+		data |= BIT(12) | BIT(13) | BIT(14);
+		data &= ~BIT(15);
+		ocp_reg_write(tp, 0xac8a, data);
+		data = ocp_reg_read(tp, 0xad18);
+		data |= BIT(10);
+		ocp_reg_write(tp, 0xad18, data);
+		data = ocp_reg_read(tp, 0xad1a);
+		data |= 0x3ff;
+		ocp_reg_write(tp, 0xad1a, data);
+		data = ocp_reg_read(tp, 0xad1c);
+		data |= 0x3ff;
+		ocp_reg_write(tp, 0xad1c, data);
+
+		data = sram_read(tp, 0x80ea);
+		data &= ~0xff00;
+		data |= 0xc400;
+		sram_write(tp, 0x80ea, data);
+		data = sram_read(tp, 0x80eb);
+		data &= ~0x0700;
+		data |= 0x0300;
+		sram_write(tp, 0x80eb, data);
+		data = sram_read(tp, 0x80f8);
+		data &= ~0xff00;
+		data |= 0x1c00;
+		sram_write(tp, 0x80f8, data);
+		data = sram_read(tp, 0x80f1);
+		data &= ~0xff00;
+		data |= 0x3000;
+		sram_write(tp, 0x80f1, data);
+
+		data = sram_read(tp, 0x80fe);
+		data &= ~0xff00;
+		data |= 0xa500;
+		sram_write(tp, 0x80fe, data);
+		data = sram_read(tp, 0x8102);
+		data &= ~0xff00;
+		data |= 0x5000;
+		sram_write(tp, 0x8102, data);
+		data = sram_read(tp, 0x8015);
+		data &= ~0xff00;
+		data |= 0x3300;
+		sram_write(tp, 0x8015, data);
+		data = sram_read(tp, 0x8100);
+		data &= ~0xff00;
+		data |= 0x7000;
+		sram_write(tp, 0x8100, data);
+		data = sram_read(tp, 0x8014);
+		data &= ~0xff00;
+		data |= 0xf000;
+		sram_write(tp, 0x8014, data);
+		data = sram_read(tp, 0x8016);
+		data &= ~0xff00;
+		data |= 0x6500;
+		sram_write(tp, 0x8016, data);
+		data = sram_read(tp, 0x80dc);
+		data &= ~0xff00;
+		data |= 0xed00;
+		sram_write(tp, 0x80dc, data);
+		data = sram_read(tp, 0x80df);
+		data |= BIT(8);
+		sram_write(tp, 0x80df, data);
+		data = sram_read(tp, 0x80e1);
+		data &= ~BIT(8);
+		sram_write(tp, 0x80e1, data);
+
+		data = ocp_reg_read(tp, 0xbf06);
+		data &= ~0x003f;
+		data |= 0x0038;
+		ocp_reg_write(tp, 0xbf06, data);
+
+		sram_write(tp, 0x819f, 0xddb6);
+
+		ocp_reg_write(tp, 0xbc34, 0x5555);
+		data = ocp_reg_read(tp, 0xbf0a);
+		data &= ~0x0e00;
+		data |= 0x0a00;
+		ocp_reg_write(tp, 0xbf0a, data);
+
+		data = ocp_reg_read(tp, 0xbd2c);
+		data &= ~BIT(13);
+		ocp_reg_write(tp, 0xbd2c, data);
+		break;
+	case RTL_VER_11:
+		data = ocp_reg_read(tp, 0xad4e);
+		data |= BIT(4);
+		ocp_reg_write(tp, 0xad4e, data);
+		data = ocp_reg_read(tp, 0xad16);
+		data |= 0x3ff;
+		ocp_reg_write(tp, 0xad16, data);
+		data = ocp_reg_read(tp, 0xad32);
+		data &= ~0x3f;
+		data |= 6;
+		ocp_reg_write(tp, 0xad32, data);
+		data = ocp_reg_read(tp, 0xac08);
+		data &= ~(BIT(12) | BIT(8));
+		ocp_reg_write(tp, 0xac08, data);
+		data = ocp_reg_read(tp, 0xacc0);
+		data &= ~0x3;
+		data |= BIT(1);
+		ocp_reg_write(tp, 0xacc0, data);
+		data = ocp_reg_read(tp, 0xad40);
+		data &= ~0xe7;
+		data |= BIT(6) | BIT(2);
+		ocp_reg_write(tp, 0xad40, data);
+		data = ocp_reg_read(tp, 0xac14);
+		data &= ~BIT(7);
+		ocp_reg_write(tp, 0xac14, data);
+		data = ocp_reg_read(tp, 0xac80);
+		data &= ~(BIT(8) | BIT(9));
+		ocp_reg_write(tp, 0xac80, data);
+		data = ocp_reg_read(tp, 0xac5e);
+		data &= ~0x7;
+		data |= BIT(1);
+		ocp_reg_write(tp, 0xac5e, data);
+		ocp_reg_write(tp, 0xad4c, 0x00a8);
+		data = ocp_reg_read(tp, 0xac5c);
+		data &= ~0x38;
+		data |= BIT(3);
+		ocp_reg_write(tp, 0xac5c, data);
+		data = ocp_reg_read(tp, 0xac8a);
+		data &= ~0xf0;
+		data |= BIT(4) | BIT(5);
+		ocp_reg_write(tp, 0xac8a, data);
+		ocp_reg_write(tp, 0xb87c, 0x80a2);
+		ocp_reg_write(tp, 0xb87e, 0x0153);
+		ocp_reg_write(tp, 0xb87c, 0x809c);
+		ocp_reg_write(tp, 0xb87e, 0x0153);
+
+		ocp_write_word(tp, MCU_TYPE_PLA, 0xe058, 0x0056);
+
+		ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, 0xe952);
+		ocp_data |= BIT(1) | BIT(2);
+		ocp_write_word(tp, MCU_TYPE_PLA, 0xe952, ocp_data);
+
+		ocp_reg_write(tp, OCP_SRAM_ADDR, 0x81B3);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0043);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00A7);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00D6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00EC);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00F6);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00FB);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00FD);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00FF);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x00BB);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0058);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0029);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0013);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0009);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0004);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0002);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+		ocp_reg_write(tp, OCP_SRAM_DATA, 0x0000);
+
+		sram_write(tp, 0x8257, 0x020f);
+		sram_write(tp, 0x80ea, 0x7843);
+		if (r8153_patch_request(tp, true)) {
+			netif_err(tp, drv, tp->netdev,
+				  "patch request error\n");
+			return;
+		}
+
+		data = ocp_reg_read(tp, 0xb896);
+		data &= ~BIT(0);
+		ocp_reg_write(tp, 0xb896, data);
+
+		data = ocp_reg_read(tp, 0xb892);
+		data &= ~0xff00;
+		ocp_reg_write(tp, 0xb892, data);
+
+		ocp_reg_write(tp, 0xB88E, 0xC091);
+		ocp_reg_write(tp, 0xB890, 0x6E12);
+		ocp_reg_write(tp, 0xB88E, 0xC092);
+		ocp_reg_write(tp, 0xB890, 0x1214);
+		ocp_reg_write(tp, 0xB88E, 0xC094);
+		ocp_reg_write(tp, 0xB890, 0x1516);
+		ocp_reg_write(tp, 0xB88E, 0xC096);
+		ocp_reg_write(tp, 0xB890, 0x171B);
+		ocp_reg_write(tp, 0xB88E, 0xC098);
+		ocp_reg_write(tp, 0xB890, 0x1B1C);
+		ocp_reg_write(tp, 0xB88E, 0xC09A);
+		ocp_reg_write(tp, 0xB890, 0x1F1F);
+		ocp_reg_write(tp, 0xB88E, 0xC09C);
+		ocp_reg_write(tp, 0xB890, 0x2021);
+		ocp_reg_write(tp, 0xB88E, 0xC09E);
+		ocp_reg_write(tp, 0xB890, 0x2224);
+		ocp_reg_write(tp, 0xB88E, 0xC0A0);
+		ocp_reg_write(tp, 0xB890, 0x2424);
+		ocp_reg_write(tp, 0xB88E, 0xC0A2);
+		ocp_reg_write(tp, 0xB890, 0x2424);
+		ocp_reg_write(tp, 0xB88E, 0xC0A4);
+		ocp_reg_write(tp, 0xB890, 0x2424);
+		ocp_reg_write(tp, 0xB88E, 0xC018);
+		ocp_reg_write(tp, 0xB890, 0x0AF2);
+		ocp_reg_write(tp, 0xB88E, 0xC01A);
+		ocp_reg_write(tp, 0xB890, 0x0D4A);
+		ocp_reg_write(tp, 0xB88E, 0xC01C);
+		ocp_reg_write(tp, 0xB890, 0x0F26);
+		ocp_reg_write(tp, 0xB88E, 0xC01E);
+		ocp_reg_write(tp, 0xB890, 0x118D);
+		ocp_reg_write(tp, 0xB88E, 0xC020);
+		ocp_reg_write(tp, 0xB890, 0x14F3);
+		ocp_reg_write(tp, 0xB88E, 0xC022);
+		ocp_reg_write(tp, 0xB890, 0x175A);
+		ocp_reg_write(tp, 0xB88E, 0xC024);
+		ocp_reg_write(tp, 0xB890, 0x19C0);
+		ocp_reg_write(tp, 0xB88E, 0xC026);
+		ocp_reg_write(tp, 0xB890, 0x1C26);
+		ocp_reg_write(tp, 0xB88E, 0xC089);
+		ocp_reg_write(tp, 0xB890, 0x6050);
+		ocp_reg_write(tp, 0xB88E, 0xC08A);
+		ocp_reg_write(tp, 0xB890, 0x5F6E);
+		ocp_reg_write(tp, 0xB88E, 0xC08C);
+		ocp_reg_write(tp, 0xB890, 0x6E6E);
+		ocp_reg_write(tp, 0xB88E, 0xC08E);
+		ocp_reg_write(tp, 0xB890, 0x6E6E);
+		ocp_reg_write(tp, 0xB88E, 0xC090);
+		ocp_reg_write(tp, 0xB890, 0x6E12);
+
+		data = ocp_reg_read(tp, 0xb896);
+		data |= BIT(0);
+		ocp_reg_write(tp, 0xb896, data);
+
+		ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL4);
+		ocp_data |= EEE_SPDWN_EN;
+		ocp_write_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL4, ocp_data);
+
+		data = ocp_reg_read(tp, OCP_DOWN_SPEED);
+		data &= ~(EN_EEE_100 | EN_EEE_1000);
+		data |= EN_10M_CLKDIV;
+		ocp_reg_write(tp, OCP_DOWN_SPEED, data);
+		tp->ups_info._10m_ckdiv = true;
+		tp->ups_info.eee_plloff_100 = false;
+		tp->ups_info.eee_plloff_giga = false;
+
+		data = ocp_reg_read(tp, OCP_POWER_CFG);
+		data &= ~EEE_CLKDIV_EN;
+		ocp_reg_write(tp, OCP_POWER_CFG, data);
+		tp->ups_info.eee_ckdiv = false;
+
+		ocp_reg_write(tp, OCP_SYSCLK_CFG, 0);
+		ocp_reg_write(tp, OCP_SYSCLK_CFG, clk_div_expo(5));
+		tp->ups_info._250m_ckdiv = false;
+
+		r8153_patch_request(tp, false);
+
+		data = ocp_reg_read(tp, 0xd068);
+		data |= BIT(13);
+		ocp_reg_write(tp, 0xd068, data);
+
+		data = sram_read(tp, 0x81a2);
+		data &= ~BIT(8);
+		sram_write(tp, 0x81a2, data);
+
+		data = ocp_reg_read(tp, 0xa454);
+		data &= BIT(0);
+		ocp_reg_write(tp, 0xa454, data);
+		break;
+	default:
+		break;
+	}
+
+	if (!pcut_entr) {
+		data = ocp_reg_read(tp, 0xa428);
+		data &= ~BIT(9);
+		ocp_reg_write(tp, 0xa428, data);
+		data = ocp_reg_read(tp, 0xa5ea);
+		data &= ~BIT(0);
+		ocp_reg_write(tp, 0xa5ea, data);
+		tp->ups_info.lite_mode = 0;
+
+		if (tp->eee_en) {
+			r8156_eee_en(tp, true);
+			ocp_reg_write(tp, OCP_EEE_ADV, tp->eee_adv);
+		}
+
+		r8153_aldps_en(tp, true);
+		r8152b_enable_fc(tp);
+		r8153_u2p3en(tp, true);
+
+		set_bit(PHY_RESET, &tp->flags);
+	}
+}
+
+static void r8156_hw_phy_cfg(struct r8152 *tp)
+{
+	u32 ocp_data;
+	u16 data;
+
+	data = r8153_phy_status(tp, PHY_STAT_LAN_ON);
+
+	/* disable ALDPS before updating the PHY parameters */
+	r8153_aldps_en(tp, false);
+
+	/* disable EEE before updating the PHY parameters */
+	r8153_eee_en(tp, false);
+	ocp_reg_write(tp, OCP_EEE_ADV, 0);
+
+	r8156_firmware(tp);
+
+	data = ocp_reg_read(tp, 0xa5d4);
+	data |= BIT(7) | BIT(0);
+	ocp_reg_write(tp, 0xa5d4, data);
+	ocp_reg_write(tp, 0xa5e6, 0x6290);
+
+	data = ocp_reg_read(tp, 0xa5e8);
+	data &= ~BIT(3);
+	ocp_reg_write(tp, 0xa5e8, data);
+	data = ocp_reg_read(tp, 0xa428);
+	data |= BIT(9);
+	ocp_reg_write(tp, 0xa428, data);
+
+	ocp_reg_write(tp, 0xb636, 0x2c00);
+	data = ocp_reg_read(tp, 0xb460);
+	data &= ~BIT(13);
+	ocp_reg_write(tp, 0xb460, data);
+	ocp_reg_write(tp, 0xb83e, 0x00a9);
+	ocp_reg_write(tp, 0xb840, 0x0035);
+	ocp_reg_write(tp, 0xb680, 0x0022);
+	ocp_reg_write(tp, 0xb468, 0x10c0);
+	ocp_reg_write(tp, 0xb468, 0x90c0);
+
+	data = ocp_reg_read(tp, 0xb60a);
+	data &= ~0xfff;
+	data |= 0xc0;
+	ocp_reg_write(tp, 0xb60a, data);
+	data = ocp_reg_read(tp, 0xb628);
+	data &= ~0xfff;
+	data |= 0xc0;
+	ocp_reg_write(tp, 0xb628, data);
+	data = ocp_reg_read(tp, 0xb62a);
+	data &= ~0xfff;
+	data |= 0xc0;
+	ocp_reg_write(tp, 0xb62a, data);
+
+	data = ocp_reg_read(tp, 0xbc1e);
+	data &= 0xf;
+	data |= (data << 4) | (data << 8) | (data << 12);
+	ocp_reg_write(tp, 0xbce0, data);
+	data = ocp_reg_read(tp, 0xbd42);
+	data &= ~BIT(8);
+	ocp_reg_write(tp, 0xbd42, data);
+
+	data = ocp_reg_read(tp, 0xbf90);
+	data &= ~0xf0;
+	data |= BIT(7);
+	ocp_reg_write(tp, 0xbf90, data);
+	data = ocp_reg_read(tp, 0xbf92);
+	data &= ~0x3f;
+	data |= 0x3fc0;
+	ocp_reg_write(tp, 0xbf92, data);
+
+	data = ocp_reg_read(tp, 0xbf94);
+	data |= 0x3e00;
+	ocp_reg_write(tp, 0xbf94, data);
+	data = ocp_reg_read(tp, 0xbf88);
+	data &= ~0x3eff;
+	data |= 0x1e01;
+	ocp_reg_write(tp, 0xbf88, data);
+
+	data = ocp_reg_read(tp, 0xbc58);
+	data &= ~BIT(1);
+	ocp_reg_write(tp, 0xbc58, data);
+
+	data = ocp_reg_read(tp, 0xbd0c);
+	data &= ~0x3f;
+	ocp_reg_write(tp, 0xbd0c, data);
+
+	data = ocp_reg_read(tp, 0xbcc2);
+	data &= ~BIT(14);
+	ocp_reg_write(tp, 0xbcc2, data);
+
+	ocp_reg_write(tp, 0xd098, 0x0427);
+
+	data = ocp_reg_read(tp, 0xa430);
+	data &= ~BIT(12);
+	ocp_reg_write(tp, 0xa430, data);
+
+	ocp_data = ocp_read_dword(tp, MCU_TYPE_PLA, 0xe84c);
+	ocp_data |= BIT(6);
+	ocp_write_dword(tp, MCU_TYPE_PLA, 0xe84c, ocp_data);
+
+	data = ocp_reg_read(tp, 0xbeb4);
+	data &= ~BIT(1);
+	ocp_reg_write(tp, 0xbeb4, data);
+	data = ocp_reg_read(tp, 0xbf0c);
+	data &= ~BIT(13);
+	data |= BIT(12);
+	ocp_reg_write(tp, 0xbf0c, data);
+	data = ocp_reg_read(tp, 0xbd44);
+	data &= ~BIT(2);
+	ocp_reg_write(tp, 0xbd44, data);
+
+	data = ocp_reg_read(tp, 0xa442);
+	data |= BIT(11);
+	ocp_reg_write(tp, 0xa442, data);
+	ocp_data = ocp_read_dword(tp, MCU_TYPE_PLA, 0xe84c);
+	ocp_data |= BIT(7);
+	ocp_write_dword(tp, MCU_TYPE_PLA, 0xe84c, ocp_data);
+
+	r8156_lock_mian(tp, true);
+	data = ocp_reg_read(tp, 0xcc46);
+	data &= ~0x700;
+	ocp_reg_write(tp, 0xcc46, data);
+	data = ocp_reg_read(tp, 0xcc46);
+	data &= ~0x70;
+	ocp_reg_write(tp, 0xcc46, data);
+	data = ocp_reg_read(tp, 0xcc46);
+	data &= ~0x70;
+	data |= BIT(6) | BIT(4);
+	ocp_reg_write(tp, 0xcc46, data);
+	r8156_lock_mian(tp, false);
+
+	data = ocp_reg_read(tp, 0xbd38);
+	data &= ~BIT(13);
+	ocp_reg_write(tp, 0xbd38, data);
+	data = ocp_reg_read(tp, 0xbd38);
+	data |= BIT(12);
+	ocp_reg_write(tp, 0xbd38, data);
+	ocp_reg_write(tp, 0xbd36, 0x0fb4);
+	data = ocp_reg_read(tp, 0xbd38);
+	data |= BIT(13);
+	ocp_reg_write(tp, 0xbd38, data);
+
+//	if (tp->eee_en) {
+//		r8153_eee_en(tp, true);
+//		ocp_reg_write(tp, OCP_EEE_ADV, tp->eee_adv);
+//	}
+
+	r8153_aldps_en(tp, true);
+	r8152b_enable_fc(tp);
+	r8153_u2p3en(tp, true);
+}
+
+static void r8156_init(struct r8152 *tp)
+{
+	u32 ocp_data;
+	u16 data;
+	int i;
+
+	if (test_bit(RTL8152_UNPLUG, &tp->flags))
+		return;
+
+	ocp_data = ocp_read_byte(tp, MCU_TYPE_USB, 0xd26b);
+	ocp_data &= ~BIT(0);
+	ocp_write_byte(tp, MCU_TYPE_USB, 0xd26b, ocp_data);
+
+	ocp_write_word(tp, MCU_TYPE_USB, 0xd32a, 0);
+
+	ocp_data = ocp_read_word(tp, MCU_TYPE_USB, 0xcfee);
+	ocp_data |= BIT(5);
+	ocp_write_word(tp, MCU_TYPE_USB, 0xcfee, ocp_data);
+
+	r8153b_u1u2en(tp, false);
+
+	for (i = 0; i < 500; i++) {
+		if (ocp_read_word(tp, MCU_TYPE_PLA, PLA_BOOT_CTRL) &
+		    AUTOLOAD_DONE)
+			break;
+		msleep(20);
+	}
+
+	data = r8153_phy_status(tp, 0);
+	if (data == PHY_STAT_EXT_INIT) {
+		data = ocp_reg_read(tp, 0xa468);
+		data &= ~(BIT(3) | BIT(0));
+		ocp_reg_write(tp, 0xa468, data);
+	}
+
+	data = r8152_mdio_read(tp, MII_BMCR);
+	if (data & BMCR_PDOWN) {
+		data &= ~BMCR_PDOWN;
+		r8152_mdio_write(tp, MII_BMCR, data);
+	}
+
+	data = r8153_phy_status(tp, PHY_STAT_LAN_ON);
+
+	r8153_u2p3en(tp, false);
+
+	/* MSC timer = 0xfff * 8ms = 32760 ms */
+	ocp_write_word(tp, MCU_TYPE_USB, USB_MSC_TIMER, 0x0fff);
+
+	/* U1/U2/L1 idle timer. 500 us */
+	ocp_write_word(tp, MCU_TYPE_USB, USB_U1U2_TIMER, 500);
+
+	r8153b_power_cut_en(tp, false);
+	r8156_ups_en(tp, false);
+	r8156_queue_wake(tp, false);
+	rtl_runtime_suspend_enable(tp, false);
+
+	r8153b_u1u2en(tp, true);
+	usb_enable_lpm(tp->udev);
+
+	r8156_mac_clk_spd(tp, true);
+
+	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL3);
+	ocp_data &= ~BIT(14);
+	ocp_write_word(tp, MCU_TYPE_PLA, PLA_MAC_PWR_CTRL3, ocp_data);
+
+	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, 0xd398);
+	if (rtl8152_get_speed(tp) & LINK_STATUS)
+		ocp_data |= BIT(15);
+	else
+		ocp_data &= ~BIT(15);
+	ocp_data &= ~BIT(8);
+	ocp_data |= BIT(0);
+	ocp_write_word(tp, MCU_TYPE_PLA, 0xd398, ocp_data);
+
+//	set_bit(GREEN_ETHERNET, &tp->flags);
+
+	/* rx aggregation */
+	ocp_data = ocp_read_word(tp, MCU_TYPE_USB, USB_USB_CTRL);
+	ocp_data &= ~(RX_AGG_DISABLE | RX_ZERO_EN);
+	ocp_write_word(tp, MCU_TYPE_USB, USB_USB_CTRL, ocp_data);
+
+	ocp_data = ocp_read_byte(tp, MCU_TYPE_USB, 0xcfd9);
+	ocp_data |= BIT(2);
+	ocp_write_byte(tp, MCU_TYPE_USB, 0xcfd9, ocp_data);
 
 	rtl_tally_reset(tp);
 
@@ -6608,6 +10745,9 @@ static int rtl8152_runtime_suspend(struct r8152 *tp)
 {
 	struct net_device *netdev = tp->netdev;
 	int ret = 0;
+
+	if (!tp->rtl_ops.autosuspend_en)
+		return -EBUSY;
 
 	set_bit(SELECTIVE_SUSPEND, &tp->flags);
 	smp_mb__after_atomic();
@@ -6848,6 +10988,15 @@ int rtl8152_get_settings(struct net_device *netdev, struct ethtool_cmd *cmd)
 		u16 ctrl1000 = r8152_mdio_read(tp, MII_CTRL1000);
 
 		cmd->supported |= SUPPORTED_1000baseT_Full;
+
+		if (test_bit(SUPPORT_2500FULL, &tp->flags)) {
+			u16 data = ocp_reg_read(tp, 0xa5d4);
+
+			cmd->supported |= SUPPORTED_2500baseX_Full;
+			if (data & BIT(7))
+				cmd->advertising |= ADVERTISED_2500baseX_Full;
+		}
+
 		if (ctrl1000 & ADVERTISE_1000HALF)
 			cmd->advertising |= ADVERTISED_1000baseT_Half;
 		if (ctrl1000 & ADVERTISE_1000FULL)
@@ -6896,7 +11045,7 @@ int rtl8152_get_settings(struct net_device *netdev, struct ethtool_cmd *cmd)
 
 
 	if (netif_running(netdev) && netif_carrier_ok(netdev)) {
-		u8 speed = rtl8152_get_speed(tp);
+		u16 speed = rtl8152_get_speed(tp);
 
 		if (speed & _100bps)
 			cmd->speed = SPEED_100;
@@ -6904,6 +11053,9 @@ int rtl8152_get_settings(struct net_device *netdev, struct ethtool_cmd *cmd)
 			cmd->speed = SPEED_10;
 		else if (tp->mii.supports_gmii && (speed & _1000bps))
 			cmd->speed = SPEED_1000;
+		else if (test_bit(SUPPORT_2500FULL, &tp->flags) &&
+			 (speed & _2500bps))
+			cmd->speed = SPEED_2500;
 
 		cmd->duplex = (speed & FULL_DUP) ? DUPLEX_FULL : DUPLEX_HALF;
 	} else {
@@ -7055,7 +11207,14 @@ static void rtl8152_get_ethtool_stats(struct net_device *dev,
 	if (usb_autopm_get_interface(tp->intf) < 0)
 		return;
 
+	if (mutex_lock_interruptible(&tp->control) < 0) {
+		usb_autopm_put_interface(tp->intf);
+		return;
+	}
+
 	generic_ocp_read(tp, PLA_TALLYCNT, sizeof(tally), &tally, MCU_TYPE_PLA);
+
+	mutex_unlock(&tp->control);
 
 	usb_autopm_put_interface(tp->intf);
 
@@ -7086,7 +11245,7 @@ static void rtl8152_get_strings(struct net_device *dev, u32 stringset, u8 *data)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0)
 static int r8152_get_eee(struct r8152 *tp, struct ethtool_eee *eee)
 {
-	u32 ocp_data, lp, adv, supported = 0;
+	u32 lp, adv, supported = 0;
 	u16 val;
 
 	val = r8152_mmd_read(tp, MDIO_MMD_PCS, MDIO_PCS_EEE_ABLE);
@@ -7098,10 +11257,7 @@ static int r8152_get_eee(struct r8152 *tp, struct ethtool_eee *eee)
 	val = r8152_mmd_read(tp, MDIO_MMD_AN, MDIO_AN_EEE_LPABLE);
 	lp = mmd_eee_adv_to_ethtool_adv_t(val);
 
-	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_EEE_CR);
-	ocp_data &= EEE_RX_EN | EEE_TX_EN;
-
-	eee->eee_enabled = !!ocp_data;
+	eee->eee_enabled = tp->eee_en;
 	eee->eee_active = !!(supported & adv & lp);
 	eee->supported = supported;
 	eee->advertised = adv;
@@ -7115,18 +11271,21 @@ static int r8152_set_eee(struct r8152 *tp, struct ethtool_eee *eee)
 	u16 val = ethtool_adv_to_mmd_eee_adv_t(eee->advertised);
 
 	r8152_eee_en(tp, eee->eee_enabled);
+	tp->eee_en = eee->eee_enabled;
 
-	if (!eee->eee_enabled)
-		val = 0;
-
-	r8152_mmd_write(tp, MDIO_MMD_AN, MDIO_AN_EEE_ADV, val);
+	if (eee->eee_enabled) {
+		r8152_mmd_write(tp, MDIO_MMD_AN, MDIO_AN_EEE_ADV, val);
+		tp->eee_adv = val;
+	} else {
+		r8152_mmd_write(tp, MDIO_MMD_AN, MDIO_AN_EEE_ADV, 0);
+	}
 
 	return 0;
 }
 
 static int r8153_get_eee(struct r8152 *tp, struct ethtool_eee *eee)
 {
-	u32 ocp_data, lp, adv, supported = 0;
+	u32 lp, adv, supported = 0;
 	u16 val;
 
 	val = ocp_reg_read(tp, OCP_EEE_ABLE);
@@ -7138,10 +11297,7 @@ static int r8153_get_eee(struct r8152 *tp, struct ethtool_eee *eee)
 	val = ocp_reg_read(tp, OCP_EEE_LPABLE);
 	lp = mmd_eee_adv_to_ethtool_adv_t(val);
 
-	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_EEE_CR);
-	ocp_data &= EEE_RX_EN | EEE_TX_EN;
-
-	eee->eee_enabled = !!ocp_data;
+	eee->eee_enabled = tp->eee_en;
 	eee->eee_active = !!(supported & adv & lp);
 	eee->supported = supported;
 	eee->advertised = adv;
@@ -7155,11 +11311,14 @@ static int r8153_set_eee(struct r8152 *tp, struct ethtool_eee *eee)
 	u16 val = ethtool_adv_to_mmd_eee_adv_t(eee->advertised);
 
 	r8153_eee_en(tp, eee->eee_enabled);
+	tp->eee_en = eee->eee_enabled;
 
-	if (!eee->eee_enabled)
-		val = 0;
-
-	ocp_reg_write(tp, OCP_EEE_ADV, val);
+	if (eee->eee_enabled) {
+		ocp_reg_write(tp, OCP_EEE_ADV, val);
+		tp->eee_adv = val;
+	} else {
+		ocp_reg_write(tp, OCP_EEE_ADV, 0);
+	}
 
 	return 0;
 }
@@ -7168,12 +11327,32 @@ static int r8153b_set_eee(struct r8152 *tp, struct ethtool_eee *eee)
 {
 	u16 val = ethtool_adv_to_mmd_eee_adv_t(eee->advertised);
 
-	r8153b_eee_en(tp, eee->eee_enabled);
+	r8153_eee_en(tp, eee->eee_enabled);
+	tp->eee_en = eee->eee_enabled;
 
-	if (!eee->eee_enabled)
-		val = 0;
+	if (eee->eee_enabled) {
+		ocp_reg_write(tp, OCP_EEE_ADV, val);
+		tp->eee_adv = val;
+	} else {
+		ocp_reg_write(tp, OCP_EEE_ADV, 0);
+	}
 
-	ocp_reg_write(tp, OCP_EEE_ADV, val);
+	return 0;
+}
+
+static int r8156_set_eee(struct r8152 *tp, struct ethtool_eee *eee)
+{
+	u16 val = ethtool_adv_to_mmd_eee_adv_t(eee->advertised);
+
+	r8156_eee_en(tp, eee->eee_enabled);
+	tp->eee_en = eee->eee_enabled;
+
+	if (eee->eee_enabled) {
+		ocp_reg_write(tp, OCP_EEE_ADV, val);
+		tp->eee_adv = val;
+	} else {
+		ocp_reg_write(tp, OCP_EEE_ADV, 0);
+	}
 
 	return 0;
 }
@@ -7183,6 +11362,11 @@ rtl_ethtool_get_eee(struct net_device *net, struct ethtool_eee *edata)
 {
 	struct r8152 *tp = netdev_priv(net);
 	int ret;
+
+	if (!tp->rtl_ops.eee_get) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
 
 	ret = usb_autopm_get_interface(tp->intf);
 	if (ret < 0)
@@ -7205,6 +11389,11 @@ rtl_ethtool_set_eee(struct net_device *net, struct ethtool_eee *edata)
 {
 	struct r8152 *tp = netdev_priv(net);
 	int ret;
+
+	if (!tp->rtl_ops.eee_get) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
 
 	ret = usb_autopm_get_interface(tp->intf);
 	if (ret < 0)
@@ -7275,6 +11464,7 @@ static int rtl8152_set_coalesce(struct net_device *netdev,
 	case RTL_VER_01:
 	case RTL_VER_02:
 	case RTL_VER_07:
+	case RTL_TEST_01: /* fix me */
 		return -EOPNOTSUPP;
 	default:
 		break;
@@ -7708,6 +11898,9 @@ static int rtl_ops_init(struct r8152 *tp)
 		ops->in_nway		= rtl8152_in_nway;
 		ops->hw_phy_cfg		= r8152b_hw_phy_cfg;
 		ops->autosuspend_en	= rtl_runtime_suspend_enable;
+		tp->rx_buf_sz		= 16 * 1024;
+		tp->eee_en		= true;
+		tp->eee_adv		= MDIO_EEE_100TX;
 		break;
 
 	case RTL_VER_03:
@@ -7727,13 +11920,16 @@ static int rtl_ops_init(struct r8152 *tp)
 		ops->in_nway		= rtl8153_in_nway;
 		ops->hw_phy_cfg		= r8153_hw_phy_cfg;
 		ops->autosuspend_en	= rtl8153_runtime_enable;
+		tp->rx_buf_sz		= 32 * 1024;
+		tp->eee_en		= true;
+		tp->eee_adv		= MDIO_EEE_1000T | MDIO_EEE_100TX;
 		break;
 
 	case RTL_VER_08:
 	case RTL_VER_09:
 		ops->init		= r8153b_init;
 		ops->enable		= rtl8153_enable;
-		ops->disable		= rtl8153b_disable;
+		ops->disable		= rtl8153_disable;
 		ops->up			= rtl8153b_up;
 		ops->down		= rtl8153b_down;
 		ops->unload		= rtl8153b_unload;
@@ -7744,6 +11940,48 @@ static int rtl_ops_init(struct r8152 *tp)
 		ops->in_nway		= rtl8153_in_nway;
 		ops->hw_phy_cfg		= r8153b_hw_phy_cfg;
 		ops->autosuspend_en	= rtl8153b_runtime_enable;
+		tp->rx_buf_sz		= 32 * 1024;
+		tp->eee_en		= true;
+		tp->eee_adv		= MDIO_EEE_1000T | MDIO_EEE_100TX;
+		break;
+
+	case RTL_TEST_01:
+		ops->init		= r8156_init;
+		ops->enable		= rtl8156_enable;
+		ops->disable		= rtl8153_disable;
+		ops->up			= rtl8156_up;
+		ops->down		= rtl8156_down;
+		ops->unload		= rtl8153_unload;
+//#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0)
+//		ops->eee_get		= r8156_get_eee;
+//		ops->eee_set		= r8156_set_eee;
+//#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0) */
+		ops->in_nway		= rtl8153_in_nway;
+		ops->hw_phy_cfg		= r8156_hw_phy_cfg;
+		ops->autosuspend_en	= rtl8156_runtime_enable;
+		tp->rx_buf_sz		= 48 * 1024;
+		set_bit(SUPPORT_2500FULL, &tp->flags);
+		break;
+
+	case RTL_VER_11:
+		tp->eee_en		= true;
+		tp->eee_adv		= MDIO_EEE_1000T | MDIO_EEE_100TX;
+	case RTL_VER_10:
+		ops->init		= r8156_init;
+		ops->enable		= rtl8156_enable;
+		ops->disable		= rtl8153_disable;
+		ops->up			= rtl8156_up;
+		ops->down		= rtl8156_down;
+		ops->unload		= rtl8153_unload;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0)
+		ops->eee_get		= r8153_get_eee;
+		ops->eee_set		= r8156_set_eee;
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(3,6,0) */
+		ops->in_nway		= rtl8153_in_nway;
+		ops->hw_phy_cfg		= r8156_hw_phy_cfg2;
+		ops->autosuspend_en	= rtl8156_runtime_enable;
+		tp->rx_buf_sz		= 48 * 1024;
+		set_bit(SUPPORT_2500FULL, &tp->flags);
 		break;
 
 	default:
@@ -7803,6 +12041,15 @@ static u8 rtl_get_version(struct usb_interface *intf)
 	case 0x6010:
 		version = RTL_VER_09;
 		break;
+	case 0x7010:
+		version = RTL_TEST_01;
+		break;
+	case 0x7020:
+		version = RTL_VER_10;
+		break;
+	case 0x7030:
+		version = RTL_VER_11;
+		break;
 	default:
 		version = RTL_VER_UNKNOWN;
 		dev_info(&intf->dev, "Unknown version 0x%04x\n", ocp_data);
@@ -7813,6 +12060,331 @@ static u8 rtl_get_version(struct usb_interface *intf)
 
 	return version;
 }
+
+#ifdef RTL8152_DEBUG
+
+static ssize_t
+ocp_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct usb_interface *intf = to_usb_interface(dev);
+	struct r8152 *tp = usb_get_intfdata(intf);
+	char tmp[256];
+	struct tally_counter tally;
+	int ret;
+
+	strcpy(buf, dev_name(dev));
+	strcat(buf, "\n");
+	strcat(buf, DRIVER_VERSION);
+	strcat(buf, "\n");
+
+	switch (tp->version) {
+	case RTL_VER_11:
+		strcat(buf, "RTL_VER_11\n");
+		strcat(buf, "nc_patch_181008_usb\n");
+		strcat(buf, "nc1_patch_181029_usb\n");
+		strcat(buf, "nc2_patch_180821_usb\n");
+		strcat(buf, "uc2_patch_181018_usb\n");
+		strcat(buf, "USB_patch_code_20180906_v2\n");
+		strcat(buf, "PLA_patch_code_20180914_v3\n");
+		break;
+	default:
+		strcat(buf, "\n\n\n\n\n\n\n");
+		break;
+	}
+
+	ret = usb_autopm_get_interface(intf);
+	if (ret < 0)
+		return ret;
+
+	ret = mutex_lock_interruptible(&tp->control);
+	if (ret < 0) {
+		usb_autopm_put_interface(intf);
+		goto err1;
+	}
+
+	generic_ocp_read(tp, PLA_TALLYCNT, sizeof(tally), &tally, MCU_TYPE_PLA);
+
+	mutex_unlock(&tp->control);
+
+	usb_autopm_put_interface(intf);
+
+	sprintf(tmp, "tx_packets = %Lu\n", le64_to_cpu(tally.tx_packets));
+	strcat(buf, tmp);
+	sprintf(tmp, "rx_packets = %Lu\n", le64_to_cpu(tally.rx_packets));
+	strcat(buf, tmp);
+	sprintf(tmp, "tx_errors = %Lu\n", le64_to_cpu(tally.tx_errors));
+	strcat(buf, tmp);
+	sprintf(tmp, "tx_errors = %u\n", le32_to_cpu(tally.rx_errors));
+	strcat(buf, tmp);
+	sprintf(tmp, "rx_missed = %u\n", le16_to_cpu(tally.rx_missed));
+	strcat(buf, tmp);
+	sprintf(tmp, "align_errors = %u\n", le16_to_cpu(tally.align_errors));
+	strcat(buf, tmp);
+	sprintf(tmp, "tx_one_collision = %u\n",
+		le32_to_cpu(tally.tx_one_collision));
+	strcat(buf, tmp);
+	sprintf(tmp, "tx_multi_collision = %u\n",
+		le32_to_cpu(tally.tx_multi_collision));
+	strcat(buf, tmp);
+	sprintf(tmp, "rx_unicast = %Lu\n", le64_to_cpu(tally.rx_unicast));
+	strcat(buf, tmp);
+	sprintf(tmp, "rx_broadcast = %Lu\n", le64_to_cpu(tally.rx_broadcast));
+	strcat(buf, tmp);
+	sprintf(tmp, "rx_multicast = %u\n", le32_to_cpu(tally.rx_multicast));
+	strcat(buf, tmp);
+	sprintf(tmp, "tx_aborted = %u\n", le16_to_cpu(tally.tx_aborted));
+	strcat(buf, tmp);
+	sprintf(tmp, "tx_underrun = %u\n", le16_to_cpu(tally.tx_underrun));
+	strcat(buf, tmp);
+
+err1:
+	if (ret < 0)
+		return ret;
+	else
+		return strlen(buf);
+}
+
+static inline bool hex_value(char p)
+{
+	return (p >= '0' && p <= '9') ||
+	       (p >= 'a' && p <= 'f') ||
+	       (p >= 'A' && p <= 'F');
+}
+
+static int ocp_count(char *v1)
+{
+	int len = strlen(v1), count = 0;
+	char *v2 = strchr(v1, ' ');
+	bool is_vaild = false;
+
+	if (len < 5 || !v2)
+		goto out1;
+//	else if (strncmp(v1, "pla ", 4) && strncmp(v1, "usb ", 4))
+//		goto out1;
+
+	v1 = v2;
+	len = strlen(v2);
+	while(len) {
+		if (*v1 != ' ')
+			break;
+		v1++;
+		len--;
+	}
+
+	if (!len || *v1 == '\n')
+		goto out1;
+
+check:
+	v2 = strchr(v1, ' ');
+
+	if (len > 2 && !strncasecmp(v1, "0x", 2)) {
+		v1 += 2;
+		len -= 2;
+		if (v1 == v2 || *v1 == '\n')
+			goto out1;
+	}
+
+	if (v2) {
+		while (v1 < v2) {
+			if (!hex_value(*v1))
+				goto out1;
+			v1++;
+			len--;
+		}
+
+		count++;
+
+		while(len) {
+			if (*v1 != ' ')
+				break;
+			v1++;
+			len--;
+		}
+
+		if (len)
+			goto check;
+
+		is_vaild = true;
+	} else {
+		int i;
+
+		if (len && v1[len - 1] == '\n')
+			len--;
+
+		for (i = 0; i < len; i++) {
+			if (!hex_value(*v1))
+				goto out1;
+			v1++;
+		}
+
+		if (len)
+			count++;
+
+		is_vaild = true;
+	}
+
+out1:
+	if (is_vaild)
+		return count;
+	else
+		return 0;
+}
+
+static ssize_t ocp_store(struct device *dev, struct device_attribute *attr,
+			 const char *buf, size_t count)
+{
+	struct usb_interface *intf;
+	struct net_device *netdev;
+	u32 v1, v2, v3, v4;
+	struct r8152 *tp;
+	u16 type;
+	int num;
+
+	intf = to_usb_interface(dev);
+	tp = usb_get_intfdata(intf);
+	netdev = tp->netdev;
+
+	if (!strncmp(buf, "pla ", 4))
+		type = MCU_TYPE_PLA;
+	else if (!strncmp(buf, "usb ", 4))
+		type = MCU_TYPE_USB;
+	else
+		return -EINVAL;
+
+	if (!ocp_count((char *)buf))
+		return -EINVAL;
+
+	num = sscanf(strchr(buf, ' '), "%x %x %x %x\n", &v1, &v2, &v3, &v4);
+
+	if (num > 1) {
+		if ((v1 == 2 && (v2 & 1)) ||
+		    (v1 == 4 && (v2 & 3)) ||
+		    (type == MCU_TYPE_PLA &&
+		     (v2 < 0xc000 || (v2 & ~3) == PLA_OCP_GPHY_BASE)))
+			return -EINVAL;
+	}
+
+	count = usb_autopm_get_interface(intf);
+	if (count < 0)
+		return count;
+
+	count = mutex_lock_interruptible(&tp->control);
+	if (count < 0)
+		goto put;
+
+	switch(num) {
+	case 2:
+		switch (v1) {
+		case 1:
+			netif_info(tp, drv, netdev, "%s read byte %x = %x\n",
+				   type ? "PLA" : "USB", v2,
+				   ocp_read_byte(tp, type, v2));
+			break;
+		case 2:
+			netif_info(tp, drv, netdev, "%s read word %x = %x\n",
+				   type ? "PLA" : "USB", v2,
+				   ocp_read_word(tp, type, v2));
+			break;
+		case 4:
+			netif_info(tp, drv, netdev, "%s read dword %x = %x\n",
+				   type ? "PLA" : "USB", v2,
+				   ocp_read_dword(tp, type, v2));
+			break;
+		default:
+			count = -EINVAL;
+			break;
+		}
+		break;
+	case 3:
+		switch (v1) {
+		case 1:
+			netif_info(tp, drv, netdev, "%s write byte %x = %x\n",
+				   type ? "PLA" : "USB", v2, v3);
+			ocp_write_byte(tp, type, v2, v3);
+			break;
+		case 2:
+			netif_info(tp, drv, netdev, "%s write word %x = %x\n",
+				   type ? "PLA" : "USB", v2, v3);
+			ocp_write_word(tp, type, v2, v3);
+			break;
+		case 4:
+			netif_info(tp, drv, netdev, "%s write dword %x = %x\n",
+				   type ? "PLA" : "USB", v2, v3);
+			ocp_write_dword(tp, type, v2, v3);
+			break;
+		default:
+			count = -EINVAL;
+			break;
+		}
+		break;
+	case 4:
+	case 1:
+	default:
+		count = -EINVAL;
+		break;
+	}
+
+	mutex_unlock(&tp->control);
+
+put:
+	usb_autopm_put_interface(intf);
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(ocp);
+
+static struct attribute *rtk_attrs[] = {
+	&dev_attr_ocp.attr,
+	NULL
+};
+
+#define ATTR_PLA_SIZE	0x3000
+
+/* hexdump -e '"%04_ax\t" 16/1 "%02X " "\n"' pla */
+static ssize_t pla_read(struct file *fp, struct kobject *kobj,
+			struct bin_attribute *attr, char *buf, loff_t offset,
+			size_t size)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct usb_interface *intf = to_usb_interface(dev);
+	struct r8152 *tp = usb_get_intfdata(intf);
+	struct net_device *netdev = tp->netdev;
+
+	if (size <= ATTR_PLA_SIZE)
+		size = min(size, ATTR_PLA_SIZE - (size_t)offset);
+	else
+		return -EINVAL;
+
+	/* rtnl_lock(); */
+	if (mutex_lock_interruptible(&tp->control))
+		return -EINTR;
+
+	if (pla_ocp_read(tp, offset + 0xc000, (u16)size, buf) < 0)
+		netif_err(tp, drv, netdev,
+			  "Read PLA offset 0x%Lx, len = %zd fail\n",
+			  offset + 0xc000, size);
+
+	mutex_unlock(&tp->control);
+	/* rtnl_unlock(); */
+
+	return size;
+}
+
+static BIN_ATTR_RO(pla, ATTR_PLA_SIZE);
+
+static struct bin_attribute *rtk_bin_attrs[] = {
+	&bin_attr_pla,
+	NULL
+};
+
+static struct attribute_group rtk_attr_grp = {
+	.name = "nic_swsd",
+	.attrs = rtk_attrs,
+	.bin_attrs = rtk_bin_attrs,
+};
+
+#endif
 
 static int rtl8152_probe(struct usb_interface *intf,
 			 const struct usb_device_id *id)
@@ -7949,12 +12521,23 @@ static int rtl8152_probe(struct usb_interface *intf,
 			  ADVERTISED_100baseT_Half |
 			  ADVERTISED_100baseT_Full;
 	if (tp->mii.supports_gmii) {
-		tp->speed = SPEED_1000;
+		if (test_bit(SUPPORT_2500FULL, &tp->flags) &&
+		    tp->udev->speed >= USB_SPEED_SUPER) {
+			tp->speed = SPEED_2500;
+			tp->advertising |= ADVERTISED_2500baseX_Full;
+		} else {
+			tp->speed = SPEED_1000;
+		}
 		tp->advertising |= ADVERTISED_1000baseT_Full;
 	}
 	tp->duplex = DUPLEX_FULL;
 
 	intf->needs_remote_wakeup = 1;
+
+	if (!rtl_can_wakeup(tp))
+		__rtl_set_wol(tp, 0);
+	else
+		tp->saved_wolopts = __rtl_get_wol(tp);
 
 	tp->rtl_ops.init(tp);
 	queue_delayed_work(system_long_wq, &tp->hw_phy_work, 0);
@@ -7969,10 +12552,6 @@ static int rtl8152_probe(struct usb_interface *intf,
 		goto out1;
 	}
 
-	if (!rtl_can_wakeup(tp))
-		__rtl_set_wol(tp, 0);
-
-	tp->saved_wolopts = __rtl_get_wol(tp);
 	if (tp->saved_wolopts)
 		device_set_wakeup_enable(&udev->dev, true);
 	else
@@ -7982,6 +12561,11 @@ static int rtl8152_probe(struct usb_interface *intf,
 
 	netif_info(tp, probe, netdev, "%s\n", DRIVER_VERSION);
 	netif_info(tp, probe, netdev, "%s\n", PATENTS);
+
+#ifdef RTL8152_DEBUG
+	if (sysfs_create_group(&intf->dev.kobj, &rtk_attr_grp) < 0)
+		netif_err(tp, probe, netdev, "creat rtk_attr_grp fail\n");
+#endif
 
 	return 0;
 
@@ -7997,13 +12581,18 @@ static void rtl8152_disconnect(struct usb_interface *intf)
 {
 	struct r8152 *tp = usb_get_intfdata(intf);
 
+#ifdef RTL8152_DEBUG
+	sysfs_remove_group(&intf->dev.kobj, &rtk_attr_grp);
+#endif
+
 	usb_set_intfdata(intf, NULL);
 	if (tp) {
 		rtl_set_unplug(tp);
 		netif_napi_del(&tp->napi);
 		unregister_netdev(tp->netdev);
 		cancel_delayed_work_sync(&tp->hw_phy_work);
-		tp->rtl_ops.unload(tp);
+		if (tp->rtl_ops.unload)
+			tp->rtl_ops.unload(tp);
 		free_netdev(tp->netdev);
 	}
 }
@@ -8014,6 +12603,11 @@ static void rtl8152_disconnect(struct usb_interface *intf)
 { \
 	USB_DEVICE_AND_INTERFACE_INFO(vend, prod, USB_CLASS_COMM, \
 				      USB_CDC_SUBCLASS_ETHERNET, \
+				      USB_CDC_PROTO_NONE) \
+}, \
+{ \
+	USB_DEVICE_AND_INTERFACE_INFO(vend, prod, USB_CLASS_COMM, \
+				      USB_CDC_SUBCLASS_NCM, \
 				      USB_CDC_PROTO_NONE)
 
 /* table of devices that work with this driver */
@@ -8022,6 +12616,7 @@ static const struct usb_device_id rtl8152_table[] = {
 	{REALTEK_USB_DEVICE(VENDOR_ID_REALTEK, 0x8050)},
 	{REALTEK_USB_DEVICE(VENDOR_ID_REALTEK, 0x8152)},
 	{REALTEK_USB_DEVICE(VENDOR_ID_REALTEK, 0x8153)},
+	{REALTEK_USB_DEVICE(VENDOR_ID_REALTEK, 0x8156)},
 
 	/* Microsoft */
 	{REALTEK_USB_DEVICE(VENDOR_ID_MICROSOFT, 0x07ab)},
@@ -8037,11 +12632,15 @@ static const struct usb_device_id rtl8152_table[] = {
 	{REALTEK_USB_DEVICE(VENDOR_ID_LENOVO, 0x3057)},
 	{REALTEK_USB_DEVICE(VENDOR_ID_LENOVO, 0x3062)},
 	{REALTEK_USB_DEVICE(VENDOR_ID_LENOVO, 0x3069)},
+	{REALTEK_USB_DEVICE(VENDOR_ID_LENOVO, 0x3082)},
 	{REALTEK_USB_DEVICE(VENDOR_ID_LENOVO, 0x7205)},
 	{REALTEK_USB_DEVICE(VENDOR_ID_LENOVO, 0x720a)},
 	{REALTEK_USB_DEVICE(VENDOR_ID_LENOVO, 0x720b)},
 	{REALTEK_USB_DEVICE(VENDOR_ID_LENOVO, 0x720c)},
 	{REALTEK_USB_DEVICE(VENDOR_ID_LENOVO, 0x7214)},
+	{REALTEK_USB_DEVICE(VENDOR_ID_LENOVO, 0x721e)},
+	{REALTEK_USB_DEVICE(VENDOR_ID_LENOVO, 0xa359)},
+	{REALTEK_USB_DEVICE(VENDOR_ID_LENOVO, 0xa387)},
 
 	/* TP-LINK */
 	{REALTEK_USB_DEVICE(VENDOR_ID_TPLINK, 0x0601)},
