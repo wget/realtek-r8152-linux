@@ -2,10 +2,15 @@
 #
 #
 
+CONFIG_CTAP_SHORT = ON
+
 ifneq ($(KERNELRELEASE),)
 	obj-m	 := r8152.o
 #	EXTRA_CFLAGS += -DRTL8152_S5_WOL
 #	EXTRA_CFLAGS += -DRTL8152_DEBUG
+	ifneq (,$(filter OFF off, $(CONFIG_CTAP_SHORT)))
+		EXTRA_CFLAGS += -DCONFIG_CTAP_SHORT_OFF
+	endif
 else
 	KERNELDIR ?= /lib/modules/$(shell uname -r)/build
 	PWD :=$(shell pwd)
@@ -16,14 +21,14 @@ else
 
 .PHONY: modules
 modules:
-	$(MAKE) -C $(KERNELDIR) SUBDIRS=$(PWD) modules
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
 
 .PHONY: all
 all: clean modules install
 
 .PHONY: clean
 clean:
-	$(MAKE) -C $(KERNELDIR) SUBDIRS=$(PWD) clean
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
 
 .PHONY: install
 install:
@@ -33,7 +38,7 @@ endif
 ifneq ($(INBOXDRIVER),)
 	rm -f $(INBOXDRIVER)
 endif
-	$(MAKE) -C $(KERNELDIR) SUBDIRS=$(PWD) INSTALL_MOD_DIR=$(TARGET_PATH) modules_install
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) INSTALL_MOD_DIR=$(TARGET_PATH) modules_install
 	modprobe r8152
 
 .PHONY: install_rules

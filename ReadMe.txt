@@ -13,6 +13,7 @@
 - For Ubuntu, you may have to run the following command after installing the
   driver.
 
+	# sudo depmod -a
 	# sudo update-initramfs -u
 
 - Example of setting speed
@@ -21,3 +22,7 @@
 	# ethtool -s eth0 autoneg on advertise 0x002f (1G)
 	# ethtool -s eth0 autoneg on advertise 0x000f (100M full)
 	# ethtool -s eth0 autoneg on advertise 0x0003 (10M full)
+
+- Disable center tap short
+
+	# make CONFIG_CTAP_SHORT=OFF modules
