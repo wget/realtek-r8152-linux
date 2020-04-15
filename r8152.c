@@ -2263,7 +2263,11 @@ static void rtl_drop_queued_tx(struct r8152 *tp)
 	}
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0)
+static void rtl8152_tx_timeout(struct net_device *netdev, unsigned int txqueue)
+#else
 static void rtl8152_tx_timeout(struct net_device *netdev)
+#endif
 {
 	struct r8152 *tp = netdev_priv(netdev);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,29)
