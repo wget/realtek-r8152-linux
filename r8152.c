@@ -17134,6 +17134,9 @@ static int rtl8152_set_ringparam(struct net_device *netdev,
 }
 
 static const struct ethtool_ops ops = {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,6,0)
+        .supported_coalesce_params = ETHTOOL_COALESCE_USECS,
+#endif
 	.get_drvinfo = rtl8152_get_drvinfo,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,20,0)
 	.get_settings = rtl8152_get_settings,
