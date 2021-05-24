@@ -38,6 +38,11 @@
 	# define fallthrough                    do {} while (0)  /* fallthrough */
 	#endif
 
+	#define MDIO_EEE_2_5GT				0x0001	/* 2.5GT EEE cap */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,1,0)
+	#define MDIO_AN_10GBT_CTRL_ADV2_5G		0x0080	/* Advertise 2.5GBASE-T */
+	#define MDIO_AN_10GBT_STAT_LP2_5G		0x0020  /* LP is 2.5GBT capable */
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5,0,0)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,20,0)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,12,0)
@@ -549,6 +554,7 @@
 		skb->next = NULL;
 	}
 #endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5,0,0) */
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5,1,0) */
 #endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0) */
 #endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5,6,0) */
 #endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5,9,0) */
