@@ -549,10 +549,12 @@
 			linkmode_clear_bit(nr, addr);
 	}
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,217) || LINUX_VERSION_CODE < KERNEL_VERSION(4,19,10)
 	static inline void skb_mark_not_on_list(struct sk_buff *skb)
 	{
 		skb->next = NULL;
 	}
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(4,14,217) || LINUX_VERSION_CODE < KERNEL_VERSION(4,19,10) */
 #endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5,0,0) */
 #endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5,1,0) */
 #endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5,4,0) */
