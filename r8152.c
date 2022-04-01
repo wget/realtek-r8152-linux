@@ -18481,8 +18481,15 @@ static int rtl8152_set_tunable(struct net_device *netdev,
 }
 #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(3,18,0) */
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,17,0)
 static void rtl8152_get_ringparam(struct net_device *netdev,
 				  struct ethtool_ringparam *ring)
+#else
+static void rtl8152_get_ringparam(struct net_device *netdev,
+				  struct ethtool_ringparam *ring,
+				  struct kernel_ethtool_ringparam *kernel_ring,
+				  struct netlink_ext_ack *extack)
+#endif
 {
 	struct r8152 *tp = netdev_priv(netdev);
 
@@ -18490,8 +18497,15 @@ static void rtl8152_get_ringparam(struct net_device *netdev,
 	ring->rx_pending = tp->rx_pending;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,17,0)
 static int rtl8152_set_ringparam(struct net_device *netdev,
 				 struct ethtool_ringparam *ring)
+#else
+static int rtl8152_set_ringparam(struct net_device *netdev,
+				 struct ethtool_ringparam *ring,
+				 struct kernel_ethtool_ringparam *kernel_ring,
+				 struct netlink_ext_ack *extack)
+#endif
 {
 	struct r8152 *tp = netdev_priv(netdev);
 
