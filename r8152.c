@@ -25,6 +25,12 @@
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <net/ip6_checksum.h>
+// Linux 6.4.10 added net/gso.h
+#if defined __has_include
+#if __has_include (<net/gso.h>)
+#include <net/gso.h>
+#endif
+#endif
 #include <linux/usb/cdc.h>
 #include <linux/suspend.h>
 #include <linux/atomic.h>
