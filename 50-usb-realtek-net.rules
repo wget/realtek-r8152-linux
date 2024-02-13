@@ -43,4 +43,7 @@ ATTR{idVendor}=="0955", ATTR{idProduct}=="09ff", ATTR{bConfigurationValue}!="$en
 # LINKSYS
 ATTR{idVendor}=="13b1", ATTR{idProduct}=="0041", ATTR{bConfigurationValue}!="$env{REALTEK_MODE1}", ATTR{bConfigurationValue}="$env{REALTEK_MODE1}"
 
+# ASUS
+ATTR{idVendor}=="0b05", ATTR{idProduct}=="1976", ATTR{bConfigurationValue}!="$env{REALTEK_MODE1}", ATTR{bConfigurationValue}="$env{REALTEK_MODE1}"
+
 LABEL="usb_realtek_net_end"

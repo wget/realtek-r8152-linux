@@ -18626,8 +18626,13 @@ static void rtl8152_get_drvinfo(struct net_device *netdev,
 {
 	struct r8152 *tp = netdev_priv(netdev);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,3,0)
+	strncpy(info->driver, MODULENAME, sizeof(info->driver));
+	strncpy(info->version, DRIVER_VERSION, sizeof(info->version));
+#else
 	strscpy(info->driver, MODULENAME, sizeof(info->driver));
 	strscpy(info->version, DRIVER_VERSION, sizeof(info->version));
+#endif
 	usb_make_path(tp->udev, info->bus_info, sizeof(info->bus_info));
 }
 
