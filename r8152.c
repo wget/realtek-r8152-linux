@@ -19148,6 +19148,7 @@ static int r8152_set_eee(struct r8152 *tp, struct ethtool_eee *eee)
 #else
 	u16 val = ethtool_adv_to_mmd_eee_adv_t(eee->advertised);
 #endif
+
 	tp->eee_en = eee->eee_enabled;
 	tp->eee_adv = val;
 
