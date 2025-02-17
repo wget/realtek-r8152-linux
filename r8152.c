@@ -24116,8 +24116,13 @@ static void rtl8152_get_drvinfo(struct net_device *netdev,
 {
 	struct r8152 *tp = netdev_priv(netdev);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,3,0)
+	strlcpy(info->driver, MODULENAME, sizeof(info->driver));
+	strlcpy(info->version, DRIVER_VERSION, sizeof(info->version));
+#else
 	strscpy(info->driver, MODULENAME, sizeof(info->driver));
 	strscpy(info->version, DRIVER_VERSION, sizeof(info->version));
+#endif
 	usb_make_path(tp->udev, info->bus_info, sizeof(info->bus_info));
 }
 
@@ -25418,7 +25423,11 @@ static int rtltool_ioctl(struct r8152 *tp, struct ifreq *ifr)
 		uinfo->idVendor = __le16_to_cpu(udev->descriptor.idVendor);
 		uinfo->idProduct = __le16_to_cpu(udev->descriptor.idProduct);
 		uinfo->bcdDevice = __le16_to_cpu(udev->descriptor.bcdDevice);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,3,0)
+		strlcpy(uinfo->devpath, udev->devpath, sizeof(udev->devpath));
+#else
 		strscpy(uinfo->devpath, udev->devpath, sizeof(udev->devpath));
+#endif
 		pla_ocp_read(tp, PLA_IDR, sizeof(uinfo->dev_addr),
 			     uinfo->dev_addr);
 
