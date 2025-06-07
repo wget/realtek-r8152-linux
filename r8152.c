@@ -818,7 +818,7 @@ enum rtl_register_content {
 #define mtu_to_size(m)		((m) + VLAN_ETH_HLEN + ETH_FCS_LEN)
 #define size_to_mtu(s)		((s) - VLAN_ETH_HLEN - ETH_FCS_LEN)
 
-#define RTL_MAX_SG_NUM		16
+#define RTL_MAX_SG_NUM		32	// Ensure RTL_MAX_SG_NUM is large enough to enqueue fragmenented packet to prevent CPU stall
 
 /* rtl8152 flags */
 enum rtl8152_flags {
@@ -3077,6 +3077,8 @@ static int r8152_tx_agg_fill(struct r8152 *tp, struct tx_agg *agg)
 	struct net_device *netdev = tp->netdev;
 	int remain, ret;
 	u8 *tx_data;
+	int processed_in_loop = 0;
+	const int max_processed_in_loop = 8;
 
 	__skb_queue_head_init(&skb_head);
 	spin_lock(&tx_queue->lock);
@@ -3138,6 +3140,13 @@ static int r8152_tx_agg_fill(struct r8152 *tp, struct tx_agg *agg)
 
 		remain = agg_buf_sz -
 			 (int)(tx_agg_align(tp, tx_data) - agg->head);
+
+		processed_in_loop++;
+		if (processed_in_loop >= max_processed_in_loop)
+		{
+			cond_resched();
+			processed_in_loop = 0;
+		}
 	}
 
 	if (!skb_queue_empty(&skb_head)) {
@@ -3183,6 +3192,8 @@ static int r8152_tx_agg_sg_fill(struct r8152 *tp, struct tx_agg *agg)
 	int max_sg_num, ret, sg_num;
 	struct scatterlist *sg;
 	int padding = 0;
+	int processed_in_loop = 0;
+	const int max_processed_in_loop = 8;
 
 	__skb_queue_head_init(&skb_head);
 	spin_lock(&tx_queue->lock);
@@ -3270,6 +3281,13 @@ static int r8152_tx_agg_sg_fill(struct r8152 *tp, struct tx_agg *agg)
 
 		padding = len + tp->tx_desc.size;
 		padding = ALIGN(padding, tp->tx_desc.align) - padding;
+
+		processed_in_loop++;
+		if (processed_in_loop >= max_processed_in_loop)
+		{
+			cond_resched();
+			processed_in_loop = 0;
+		}
 	}
 
 	if (!skb_queue_empty(&skb_head)) {
@@ -3651,45 +3669,109 @@ out1:
 	return work_done;
 }
 
+
+
 static void tx_bottom(struct r8152 *tp)
 {
-	int res;
+	int res = 0; // Initialize res to ensure loop condition is well-defined at start
+	unsigned int iteration_count = 0;
+	// Budgeting based on iterations to prevent endless loops on unprocessable SKBs
+	// If an SKB is unprocessable, the fill function will likely return res=0 & agg->skb_num=0.
+	// We want to limit how many times we try this before yielding.
+	const unsigned int max_iterations_per_tasklet_run = 8;
+
+	// netif_info(tp, tx_queued, tp->netdev, "tx_bottom ENTER, tx_queue_len=%u\n", skb_queue_len(&tp->tx_queue)); // DEBUG
 
 	do {
 		struct net_device *netdev = tp->netdev;
 		struct tx_agg *agg;
 
-		if (skb_queue_empty(&tp->tx_queue))
+		if (skb_queue_empty(&tp->tx_queue)) {
+			// netif_info(tp, tx_queued, netdev, "tx_bottom: tx_queue empty, breaking.\n"); // DEBUG
 			break;
+		}
+
+		if (iteration_count >= max_iterations_per_tasklet_run) {
+			// netif_info(tp, tx_queued, netdev, "tx_bottom: Max iterations (%u) hit, rescheduling.\n", max_iterations_per_tasklet_run); // DEBUG
+			if (!skb_queue_empty(&tp->tx_queue))
+				tasklet_schedule(&tp->tx_tl);
+			break;
+		}
+		iteration_count++;
 
 		agg = r8152_get_tx_agg(tp);
-		if (!agg)
+		if (!agg) {
+			// netif_info(tp, tx_queued, netdev, "tx_bottom: No free agg blocks, stopping queue.\n"); // DEBUG
+			// Only stop queue if it was running and we intended to send but couldn't get an agg.
+			// If queue is already stopped, or if it's empty, no need to stop again.
+			if (netif_running(netdev) && !netif_queue_stopped(netdev)) {
+				netif_stop_queue(netdev);
+			}
 			break;
-
-		if (tp->sg_use)
-			res = r8152_tx_agg_sg_fill(tp, agg);
-		else
-			res = r8152_tx_agg_fill(tp, agg);
-
-		if (!res)
-			continue;
-
-		if (res == -ENODEV) {
-			rtl_set_unplug(tp);
-			netif_device_detach(netdev);
-		} else {
-			struct net_device_stats *stats = &netdev->stats;
-			unsigned long flags;
-
-			netif_warn(tp, tx_err, netdev,
-				   "failed tx_urb %d\n", res);
-			stats->tx_dropped += agg->skb_num;
-
-			spin_lock_irqsave(&tp->tx_lock, flags);
-			list_add_tail(&agg->list, &tp->tx_free);
-			spin_unlock_irqrestore(&tp->tx_lock, flags);
 		}
-	} while (res == 0);
+
+		// Reset agg fields for this new attempt
+		agg->skb_num = 0;
+		agg->skb_len = 0;
+		agg->skb_bytes = 0;
+
+		if (tp->sg_use) {
+			// netif_info(tp, tx_queued, netdev, "tx_bottom: Calling r8152_tx_agg_sg_fill for iteration %u\n", iteration_count); // DEBUG
+			// For SG, tx_skb queue needs to be empty before fill
+			WARN_ON_ONCE(!skb_queue_empty(&agg->tx_skb));
+			res = r8152_tx_agg_sg_fill(tp, agg);
+		} else {
+			// netif_info(tp, tx_queued, netdev, "tx_bottom: Calling r8152_tx_agg_fill for iteration %u\n", iteration_count); // DEBUG
+			res = r8152_tx_agg_fill(tp, agg);
+		}
+		// netif_info(tp, tx_queued, netdev, "tx_bottom loop iter %u: res=%d, agg->skb_num=%u\n", iteration_count, res, agg->skb_num); // DEBUG
+
+		if (res == 0) { // URB submission likely OK OR agg was empty (no SKBs processed by fill)
+			if (agg->skb_num > 0) {
+				// Successfully processed an aggregation with data, reset iteration_count
+				// to allow full budget for next set of packets if tx_queue is not empty.
+				iteration_count = 0; // Reset if progress was made
+			} else {
+				// Fill function returned 0, but agg->skb_num is 0.
+				// This means an agg block was acquired, but fill func couldn't put SKBs in it
+				// (e.g., head of tx_queue was unprocessable or tx_queue became empty before splice).
+				// The agg block should have been returned to tx_free by the fill function in this case.
+				// So, r8152_get_tx_agg in the next iteration should still work if tx_free is not empty.
+				// netif_info(tp, tx_queued, netdev, "tx_bottom: iter %u, res=0 but agg->skb_num=0. Continuing.\n", iteration_count); // DEBUG
+			}
+			continue;
+		}
+
+		/* res < 0 means error from usb_submit_urb or similar */
+		/* The agg block was not submitted or failed submission. It should be returned to tx_free. */
+		/* Note: r8152_tx_agg_fill/sg_fill already handle returning agg on their internal errors before URB submission, */
+		/* or if sg_num == 0 for sg_fill. This path is mainly for usb_submit_urb failure. */
+		if (res < 0) { // Explicitly check for res < 0 for error handling
+			struct net_device_stats *stats = &netdev->stats;
+			unsigned long flags_err;
+
+			netif_warn(tp, tx_err, netdev, "failed tx_urb %d in iter %u\n", res, iteration_count);
+
+			// Ensure stats->tx_dropped is only incremented if agg->skb_num was > 0
+			// (i.e., if SKBs were actually prepared for this agg before submission failed).
+			// However, skb_num would reflect what *would have been sent*.
+			if (agg->skb_num > 0) {
+				stats->tx_dropped += agg->skb_num;
+				// If SG was used, clear the skb list in agg
+				if (tp->sg_use) {
+					while (!skb_queue_empty(&agg->tx_skb))
+					dev_kfree_skb_any(__skb_dequeue(&agg->tx_skb));
+				}
+			}
+			// Return the agg block to the free list
+			spin_lock_irqsave(&tp->tx_lock, flags_err);
+			list_add_tail(&agg->list, &tp->tx_free);
+			spin_unlock_irqrestore(&tp->tx_lock, flags_err);
+			// Loop will terminate due to res != 0
+		}
+	} while (res == 0); // Loop continues if res=0 (submission OK or empty agg handled) AND budget not hit.
+
+	// netif_info(tp, tx_queued, tp->netdev, "tx_bottom EXIT, tx_queue_len=%u, total_loops=%u\n", skb_queue_len(&tp->tx_queue), iteration_count); // DEBUG
 }
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5,9,0)
