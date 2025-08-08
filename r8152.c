@@ -35,6 +35,9 @@
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,4,10)
 #include <net/gso.h>
 #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6,4,10) */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0)
+#include <linux/socket.h>
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0) */
 
 /* Version Information */
 #define DRIVER_SUFFIX
@@ -26240,9 +26243,12 @@ static int rtl8152_post_reset(struct usb_interface *intf)
 		rtnl_lock();
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5,0,0)
 		dev_set_mac_address(tp->netdev, &sa);
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6,16,0)
 		dev_set_mac_address(tp->netdev, &sa, NULL);
-#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5,0,0) */
+#else /* >= 6.16: __kernel_sockaddr_storage API change */
+		dev_set_mac_address(tp->netdev,
+				    (struct __kernel_sockaddr_storage *)&sa, NULL);
+#endif
 		rtnl_unlock();
 	}
 
