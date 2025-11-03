@@ -3234,6 +3234,11 @@ static int r8152_tx_agg_sg_fill(struct r8152 *tp, struct tx_agg *agg)
 		len = skb->len;
 
 		if ((num_sgs + sg_num) > max_sg_num) {
+			if (!sg_num) {
+				netif_warn(tp, tx_err, netdev,
+					   "num_sgs %d > max_sg_num %d\n",
+					   num_sgs, max_sg_num);
+			}
 			__skb_queue_head(&skb_head, skb);
 			break;
 		}
@@ -3657,21 +3662,25 @@ out1:
 static void tx_bottom(struct r8152 *tp)
 {
 	int res;
+	struct sk_buff *prev_skb = NULL;
 
 	do {
 		struct net_device *netdev = tp->netdev;
 		struct tx_agg *agg;
+		struct sk_buff *skb;
 
-		if (skb_queue_empty(&tp->tx_queue))
+		skb = skb_peek(&tp->tx_queue);
+		if (!skb)
 			break;
 
 		agg = r8152_get_tx_agg(tp);
 		if (!agg)
 			break;
 
-		if (tp->sg_use)
+		if (tp->sg_use && skb != prev_skb) {
 			res = r8152_tx_agg_sg_fill(tp, agg);
-		else
+			prev_skb = skb;
+		} else
 			res = r8152_tx_agg_fill(tp, agg);
 
 		if (!res)
