@@ -2437,6 +2437,8 @@ static void write_bulk_callback(struct urb *urb)
 	if (test_bit(RTL8152_UNPLUG, &tp->flags))
 		return;
 
+	netif_trans_update(netdev);
+
 	if (!skb_queue_empty_lockless(&tp->tx_queue))
 		tasklet_schedule(&tp->tx_tl);
 }
@@ -2498,6 +2500,8 @@ static void write_bulk_sg_callback(struct urb *urb)
 
 	if (test_bit(RTL8152_UNPLUG, &tp->flags))
 		return;
+
+	netif_trans_update(netdev);
 
 	if (!skb_queue_empty_lockless(&tp->tx_queue))
 		tasklet_schedule(&tp->tx_tl);
