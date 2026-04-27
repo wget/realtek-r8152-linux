@@ -36,6 +36,10 @@
 #include <net/gso.h>
 #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6,4,10) */
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7,0,0)
+#include <linux/hex.h>
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(7,0,0) */
+
 /* Version Information */
 #define DRIVER_SUFFIX
 #define DRIVER_VERSION "v2.21.4"DRIVER_SUFFIX" (2025/10/28)"
