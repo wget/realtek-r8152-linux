@@ -31846,7 +31846,7 @@ static ssize_t temperature_show(struct device *dev,
 	else
 		temp = data / 2;
 
-	sprintf(buf, "%d \u2103 (%d \u2109)\n", temp, temp * 9 / 5 + 32);
+	sprintf(buf, "%d C (%d F)\n", temp, temp * 9 / 5 + 32);
 
 put:
 	usb_autopm_put_interface(tp->intf);
