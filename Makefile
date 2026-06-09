@@ -3,6 +3,7 @@
 #
 
 CONFIG_CTAP_SHORT = ON
+SKIP_SKB_MARK_NOT_ON_LIST_COMPAT = OFF
 
 ifneq ($(KERNELRELEASE),)
 	obj-m	 := r8152.o
@@ -11,6 +12,9 @@ ifneq ($(KERNELRELEASE),)
 
 	ifneq (,$(filter OFF off, $(CONFIG_CTAP_SHORT)))
 		ccflags-y += -DCONFIG_CTAP_SHORT_OFF
+	endif
+	ifneq (,$(filter ON on 1 yes YES true TRUE, $(SKIP_SKB_MARK_NOT_ON_LIST_COMPAT)))
+		ccflags-y += -DSKIP_SKB_MARK_NOT_ON_LIST_COMPAT
 	endif
 
 	ifeq (TRUE, $(shell test $(VERSION) -lt 5 && echo "TRUE" || \
