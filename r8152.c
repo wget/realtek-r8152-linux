@@ -30512,6 +30512,9 @@ static const struct ethtool_ops ops = {
 	.set_ringparam = rtl8152_set_ringparam,
 	.get_pauseparam = rtl8152_get_pauseparam,
 	.set_pauseparam = rtl8152_set_pauseparam,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,5,0)
+    .get_ts_info = ethtool_op_get_ts_info,
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(3,5,0) */
 };
 
 static int rtltool_ioctl(struct r8152 *tp, struct ifreq *ifr)
