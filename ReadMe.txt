@@ -38,6 +38,10 @@
 
 	# make CONFIG_CTAP_SHORT=OFF modules
 
+- Skip skb_mark_not_on_list compatibility definition for kernels that backport it
+
+	# make SKIP_SKB_MARK_NOT_ON_LIST_COMPAT=ON modules
+
 - Ring parameter
 
 	Show Ring parameter
